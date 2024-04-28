@@ -8,12 +8,19 @@ pub use hal::ehal;
 pub use hal::pac;
 
 use hal::clock::GenericClockController;
-use hal::sercom::v2::{spi, uart, Sercom1, Sercom2, Sercom5};
-use hal::sercom::I2CMaster4;
+use hal::sercom::{i2c, spi, uart, Sercom2, Sercom5};
 use hal::time::Hertz;
 
 #[cfg(feature = "usb")]
 use hal::usb::{usb_device::bus::UsbBusAllocator, UsbBus};
+
+hal::bsp_peripherals!(
+    SERCOM1 { SpiSercom }
+    SERCOM2 { NinaSercom }
+    SERCOM4 { I2cSercom }
+    SERCOM5 { UartSercom }
+);
+
 
 // The docs could be further improved with details of the specific channels etc
 // Maps the pins to their arduino names and the numbers printed on the board.
@@ -225,21 +232,33 @@ pub fn usb_allocator(
     UsbBusAllocator::new(UsbBus::new(usb_clock, pm, dm, dp, usb))
 }
 
-/// Convenience for setting up the labelled SDA, SCL pins to
-/// operate as an I2C master running at the specified frequency.
+
+
+/// I2C pads for the labelled I2C peripheral
+///
+/// You can use these pads with other, user-defined [`i2c::Config`]urations.
+pub type I2cPads = i2c::Pads<I2cSercom, Sda, Scl>;
+
+/// I2C master for the labelled I2C peripheral
+///
+/// This type implements [`Read`](ehal::blocking::i2c::Read),
+/// [`Write`](ehal::blocking::i2c::Write) and
+/// [`WriteRead`](ehal::blocking::i2c::WriteRead).
+pub type I2c = i2c::I2c<i2c::Config<I2cPads>>;
 pub fn i2c_master(
     clocks: &mut GenericClockController,
-    bus_speed: impl Into<Hertz>,
-    sercom4: pac::SERCOM4,
+    baud: impl Into<Hertz>,
+    sercom: I2cSercom,
     pm: &mut pac::PM,
     sda: impl Into<Sda>,
     scl: impl Into<Scl>,
-) -> I2CMaster4<Sda, Scl> {
-    let gclk0 = &clocks.gclk0();
+) -> I2c {
+    let gclk0 = clocks.gclk0();
     let clock = &clocks.sercom4_core(&gclk0).unwrap();
-    let (bus_speed, sda, scl) = (bus_speed.into(), sda.into(), scl.into());
-
-    I2CMaster4::new(clock, bus_speed, sercom4, pm, sda, scl)
+    let freq = clock.freq();
+    let baud = baud.into();
+    let pads = i2c::Pads::new(sda.into(), scl.into());
+    i2c::Config::new(pm, sercom, pads, freq).baud(baud).enable()
 }
 
 /// UART pads
@@ -270,7 +289,7 @@ pub fn uart(
 // SPI pads for the labelled SPI peripheral
 ///
 /// You can use these pads with other, user-defined [`spi::Config`]urations.
-pub type SpiPads = spi::Pads<Sercom1, Miso, Mosi, Sck>;
+pub type SpiPads = spi::Pads<SpiSercom, Miso, Mosi, Sck>;
 
 /// SPI master for the labelled SPI peripheral
 ///
@@ -282,19 +301,19 @@ pub type Spi = spi::Spi<spi::Config<SpiPads>, spi::Duplex>;
 /// SPI Master in SPI Mode 0.
 pub fn spi_master(
     clocks: &mut GenericClockController,
-    baud: impl Into<Hertz>,
-    sercom1: pac::SERCOM1,
+    baud: Hertz,
+    sercom: SpiSercom,
     pm: &mut pac::PM,
-    sck: impl Into<Sck>,
+    sclk: impl Into<Sck>,
     mosi: impl Into<Mosi>,
     miso: impl Into<Miso>,
 ) -> Spi {
     let gclk0 = clocks.gclk0();
     let clock = clocks.sercom1_core(&gclk0).unwrap();
-    let (miso, mosi, sclk) = (miso.into(), mosi.into(), sck.into());
+    let (miso, mosi, sclk) = (miso.into(), mosi.into(), sclk.into());
     let pads = spi::Pads::default().data_in(miso).data_out(mosi).sclk(sclk);
 
-    spi::Config::new(pm, sercom1, pads, clock.freq())
+    spi::Config::new(pm, sercom, pads, clock.freq())
         .baud(baud)
         .spi_mode(spi::MODE_0)
         .enable()
@@ -315,19 +334,19 @@ pub type NinaSpi = spi::Spi<spi::Config<NinaSpiPads>, spi::Duplex>;
 /// SPI Master in SPI Mode 0.
 pub fn nina_spi_master(
     clocks: &mut GenericClockController,
-    baud: impl Into<Hertz>,
-    sercom2: pac::SERCOM2,
+    baud: Hertz,
+    sercom: NinaSercom,
     pm: &mut pac::PM,
-    sck: impl Into<NinaSck>,
+    sclk: impl Into<NinaSck>,
     mosi: impl Into<NinaMosi>,
     miso: impl Into<NinaMiso>,
 ) -> NinaSpi {
     let gclk0 = clocks.gclk0();
     let clock = clocks.sercom2_core(&gclk0).unwrap();
-    let (miso, mosi, sclk) = (miso.into(), mosi.into(), sck.into());
+    let (miso, mosi, sclk) = (miso.into(), mosi.into(), sclk.into());
     let pads = spi::Pads::default().data_in(miso).data_out(mosi).sclk(sclk);
 
-    spi::Config::new(pm, sercom2, pads, clock.freq())
+    spi::Config::new(pm, sercom, pads, clock.freq())
         .baud(baud)
         .spi_mode(spi::MODE_0)
         .enable()

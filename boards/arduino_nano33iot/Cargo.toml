@@ -15,11 +15,12 @@ version = "0.7"
 optional = true
 
 [dependencies.atsamd-hal]
-version = "0.14"
+version = "0.16"
+path = "../../hal"
 default-features = false
 
 [dependencies.usb-device]
-version = "0.2"
+version = "0.3"
 optional = true
 
 [dependencies.rand]
@@ -29,12 +30,12 @@ features = ["small_rng"]
 
 [dev-dependencies]
 cortex-m = "0.7"
-usbd-serial = "0.1"
+usbd-serial = "0.2"
 panic-halt = "0.2"
-panic-semihosting = "0.5"
-embedded-graphics = "0.7"
-st7735-lcd = "0.8"
-ssd1306 = { version = "0.7", features = ["graphics"] }
+panic-semihosting = "0.6"
+embedded-graphics = "0.8"
+st7735-lcd = "0.10"
+ssd1306 = { version = "0.8", features = ["graphics"] }
 
 [features]
 # ask the HAL to enable atsamd21g support
