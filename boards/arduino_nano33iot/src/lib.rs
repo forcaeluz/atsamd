@@ -15,10 +15,10 @@ use hal::time::Hertz;
 use hal::usb::{usb_device::bus::UsbBusAllocator, UsbBus};
 
 hal::bsp_peripherals!(
-    SERCOM1 { SpiSercom }
-    SERCOM2 { NinaSercom }
-    SERCOM4 { I2cSercom }
-    SERCOM5 { UartSercom }
+    Sercom1 { SpiSercom }
+    Sercom2 { NinaSercom }
+    Sercom4 { I2cSercom }
+    Sercom5 { UartSercom }
 );
 
 
@@ -222,7 +222,7 @@ hal::bsp_pins!(
 pub fn usb_allocator(
     usb: pac::USB,
     clocks: &mut GenericClockController,
-    pm: &mut pac::PM,
+    pm: &mut pac::Pm,
     dm: impl Into<UsbDm>,
     dp: impl Into<UsbDp>,
 ) -> UsbBusAllocator<UsbBus> {
@@ -249,7 +249,7 @@ pub fn i2c_master(
     clocks: &mut GenericClockController,
     baud: impl Into<Hertz>,
     sercom: I2cSercom,
-    pm: &mut pac::PM,
+    pm: &mut pac::Pm,
     sda: impl Into<Sda>,
     scl: impl Into<Scl>,
 ) -> I2c {
@@ -271,8 +271,8 @@ pub type Uart = uart::Uart<uart::Config<UartPads>, uart::Duplex>;
 pub fn uart(
     clocks: &mut GenericClockController,
     baud: impl Into<Hertz>,
-    sercom5: pac::SERCOM5,
-    pm: &mut pac::PM,
+    sercom5: pac::Sercom5,
+    pm: &mut pac::Pm,
     rx: impl Into<Rx>,
     tx: impl Into<Tx>,
 ) -> Uart {
@@ -303,7 +303,7 @@ pub fn spi_master(
     clocks: &mut GenericClockController,
     baud: Hertz,
     sercom: SpiSercom,
-    pm: &mut pac::PM,
+    pm: &mut pac::Pm,
     sclk: impl Into<Sck>,
     mosi: impl Into<Mosi>,
     miso: impl Into<Miso>,
@@ -336,7 +336,7 @@ pub fn nina_spi_master(
     clocks: &mut GenericClockController,
     baud: Hertz,
     sercom: NinaSercom,
-    pm: &mut pac::PM,
+    pm: &mut pac::Pm,
     sclk: impl Into<NinaSck>,
     mosi: impl Into<NinaMosi>,
     miso: impl Into<NinaMiso>,

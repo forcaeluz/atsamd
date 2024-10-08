@@ -11,11 +11,11 @@ readme = "README.md"
 edition = "2021"
 
 [dependencies.cortex-m-rt]
-version = "0.7"
+version = "0.7.3"
 optional = true
 
 [dependencies.atsamd-hal]
-version = "0.16"
+version = "0.17.0"
 path = "../../hal"
 default-features = false
 
@@ -28,6 +28,10 @@ version = "0.8"
 default-features = false
 features = ["small_rng"]
 
+[dependencies.cortex-m]
+version = "0.7"
+features = ["critical-section-single-core"]
+
 [dev-dependencies]
 cortex-m = "0.7"
 usbd-serial = "0.2"
@@ -35,14 +39,14 @@ panic-halt = "0.2"
 panic-semihosting = "0.6"
 embedded-graphics = "0.8"
 st7735-lcd = "0.10"
-ssd1306 = { version = "0.8", features = ["graphics"] }
+ssd1306 = { version = "0.9", features = ["graphics"] }
 
 [features]
 # ask the HAL to enable atsamd21g support
 default = ["rt", "atsamd-hal/samd21g"]
 rt = ["cortex-m-rt", "atsamd-hal/samd21g-rt"]
 usb = ["atsamd-hal/usb", "usb-device"]
-unproven = ["atsamd-hal/unproven"]
+# unproven = ["atsamd-hal/unproven"]
 use_semihosting = []
 
 # for cargo flash
@@ -54,7 +58,7 @@ name = "blinky_basic"
 
 [[example]]
 name = "usb_logging"
-required-features = ["usb", "unproven"]
+required-features = ["usb"]
 
 [[example]]
 name = "serial"
