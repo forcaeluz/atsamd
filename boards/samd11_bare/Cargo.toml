@@ -1,6 +1,6 @@
 [package]
 name = "samd11_bare"
-version = "0.10.0"
+version = "0.13.0"
 authors = ["Jesse Braham <jesse@beta7.io>"]
 description = "Support crate for the ATSAMD11C"
 keywords = ["no-std", "arm", "cortex-m", "embedded-hal"]
@@ -23,7 +23,7 @@ features = ["critical-section-single-core"]
 
 [dependencies.atsamd-hal]
 path = "../../hal"
-version = "0.17.0"
+version = "0.20.0"
 default-features = false
 
 [dev-dependencies]
@@ -38,14 +38,10 @@ rtt-target = { version = "0.3.0", features = ["cortex-m"] }
 default = ["rt", "atsamd-hal/samd11c"]
 dma = ["atsamd-hal/dma"]
 max-channels = ["dma", "atsamd-hal/max-channels"]
+# Enable async support from atsamd-hal
+async = ["atsamd-hal/async"]
 rt = ["cortex-m-rt", "atsamd-hal/samd11c-rt"]
 use_semihosting = []
-
-[profile.release]
-debug = true
-
-[profile.dev]
-opt-level = "s"
 
 [[example]]
 name = "adc"

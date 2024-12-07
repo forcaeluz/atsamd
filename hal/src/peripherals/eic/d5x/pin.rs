@@ -1,38 +1,10 @@
+use atsamd_hal_macros::hal_cfg;
+
 use crate::ehal_02::digital::v2::InputPin;
+use crate::eic::*;
 use crate::gpio::{
     self, pin::*, AnyPin, FloatingInterrupt, PinMode, PullDownInterrupt, PullUpInterrupt,
 };
-use crate::pac;
-use atsamd_hal_macros::hal_cfg;
-
-/// The EicPin trait makes it more ergonomic to convert a gpio pin into an EIC
-/// pin. You should not implement this trait for yourself; only the
-/// implementations in the EIC module make sense.
-// This is more complicated than it needs to be, due to the ExtInt structs being
-// defined through macros below.
-pub trait EicPin {
-    type Floating;
-    type PullUp;
-    type PullDown;
-
-    /// Configure a pin as a floating external interrupt
-    fn into_floating_ei(self) -> Self::Floating;
-
-    /// Configure a pin as pulled-up external interrupt
-    fn into_pull_up_ei(self) -> Self::PullUp;
-
-    /// Configure a pin as pulled-down external interrupt
-    fn into_pull_down_ei(self) -> Self::PullDown;
-}
-
-pub type Sense = pac::eic::config::Sense0select;
-
-pub type ExternalInterruptID = usize;
-
-/// ExternalInterrupt describes something with an external interrupt ID.
-pub trait ExternalInterrupt {
-    fn id(&self) -> ExternalInterruptID;
-}
 
 /// The pad macro defines the given EIC pin and implements EicPin for the
 /// given pins. The EicPin implementation will configure the pin for the
@@ -48,71 +20,88 @@ macro_rules! ei {
         }
     ) => {
 
-crate::paste::item! {
-    /// Represents a numbered external interrupt. The external interrupt is generic
-    /// over any pin, only the EicPin implementations in this module make sense.
-    pub struct [<$PadType $num>]<GPIO>
-    where
-        GPIO: AnyPin,
-    {
-        _pin: Pin<GPIO::Id, GPIO::Mode>,
+        crate::paste::item! {
+            $(
+                $(#[$attr])*
+                impl<M: PinMode> EicPin for Pin<gpio::$PinType, M> {
+                    type Floating = ExtInt<Pin<gpio::$PinType, FloatingInterrupt>, Self::ChId>;
+                    type PullUp = ExtInt<Pin<gpio::$PinType, PullUpInterrupt>, Self::ChId>;
+                    type PullDown = ExtInt<Pin<gpio::$PinType, PullDownInterrupt>, Self::ChId>;
+
+                    type ChId = [<Ch $num>];
+
+                    #[cfg(feature = "async")]
+                    type InterruptSource = crate::async_hal::interrupts::[<EIC_EXTINT_ $num>];
+
+                    fn into_floating_ei(self, channel: Channel<Self::ChId>) -> Self::Floating {
+                        ExtInt::new(self.into_floating_interrupt(), channel)
+                    }
+
+                    fn into_pull_up_ei(self,channel: Channel<Self::ChId>) -> Self::PullUp {
+                        ExtInt::new(self.into_pull_up_interrupt(), channel)
+                    }
+
+                    fn into_pull_down_ei(self, channel: Channel<Self::ChId>) -> Self::PullDown {
+                        ExtInt::new(self.into_pull_down_interrupt(), channel)
+                    }
+                }
+            )+
+
+        }
+    };
+}
+
+impl<P, Id, F> ExtInt<P, Id, F>
+where
+    P: EicPin,
+    Id: ChId,
+{
+    pub fn enable_event(&mut self) {
+        self.chan
+            .eic
+            .evctrl()
+            .modify(|_, w| unsafe { w.bits(1 << P::ChId::ID) });
     }
 
-    // impl !Send for [<$PadType $num>]<GPIO> {};
-    // impl !Sync for [<$PadType $num>]<GPIO> {}}
+    pub fn enable_interrupt(&mut self) {
+        self.chan
+            .eic
+            .intenset()
+            .write(|w| unsafe { w.bits(1 << P::ChId::ID) })
+    }
 
-    impl<GPIO: AnyPin> [<$PadType $num>]<GPIO> {
-        /// Construct pad from the appropriate pin in any mode.
-        /// You may find it more convenient to use the `into_pad` trait
-        /// and avoid referencing the pad type.
-        pub fn new(pin: GPIO) -> Self {
-            [<$PadType $num>]{
-                _pin: pin.into()
-            }
+    pub fn disable_interrupt(&mut self) {
+        self.chan
+            .eic
+            .intenclr()
+            .write(|w| unsafe { w.bits(1 << P::ChId::ID) })
+    }
+
+    pub fn is_interrupt(&mut self) -> bool {
+        let intflag = self.chan.eic.intflag().read().bits();
+        intflag & (1 << P::ChId::ID) != 0
+    }
+
+    pub fn state(&mut self) -> bool {
+        let state = self.chan.eic.pinstate().read().bits();
+        state & (1 << P::ChId::ID) != 0
+    }
+
+    pub fn clear_interrupt(&mut self) {
+        unsafe {
+            self.chan.eic.intflag().write(|w| w.bits(1 << P::ChId::ID));
         }
+    }
 
-        pub fn enable_event(&mut self, eic: &mut super::ConfigurableEIC) {
-            eic.eic.evctrl().modify(|_, w| unsafe {
-                w.bits(1 << $num)
-            });
-        }
-
-        pub fn enable_interrupt(&mut self, eic: &mut super::ConfigurableEIC) {
-            eic.eic.intenset().write(|w| unsafe {
-                w.bits(1 << $num)
-            })
-        }
-
-        pub fn disable_interrupt(&mut self, eic: &mut super::ConfigurableEIC) {
-            eic.eic.intenclr().write(|w| unsafe {
-                w.bits(1 << $num)
-            })
-        }
-
-        pub fn is_interrupt(&mut self) -> bool {
-            let intflag = unsafe { &(*pac::Eic::ptr()) }.intflag().read().bits();
-            intflag & (1 << $num) != 0
-        }
-
-        pub fn state(&mut self) -> bool {
-            let state = unsafe { &(*pac::Eic::ptr()) }.pinstate().read().bits();
-            state & (1 << $num) != 0
-        }
-
-        pub fn clear_interrupt(&mut self) {
-            unsafe {
-                {&(*pac::Eic::ptr())}.intflag().write(|w| { w.bits(1 << $num) });
-            }
-        }
-
-        pub fn sense(&mut self, _eic: &mut super::ConfigurableEIC, sense: Sense) {
+    pub fn sense(&mut self, sense: Sense) {
+        self.chan.with_disable(|e| {
             // Which of the two config blocks this eic config is in
-            let offset = ($num >> 3) & 0b0001;
-            let config = unsafe { &(*pac::Eic::ptr()).config(offset) };
+            let offset = (P::ChId::ID >> 3) & 0b0001;
+            let config = &e.config(offset);
 
             config.modify(|_, w| unsafe {
                 // Which of the eight eic configs in this config block
-                match $num & 0b111 {
+                match P::ChId::ID & 0b111 {
                     0b000 => w.sense0().bits(sense as u8),
                     0b001 => w.sense1().bits(sense as u8),
                     0b010 => w.sense2().bits(sense as u8),
@@ -124,16 +113,18 @@ crate::paste::item! {
                     _ => unreachable!(),
                 }
             });
-        }
+        });
+    }
 
-        pub fn filter(&mut self, _eic: &mut super::ConfigurableEIC, filter: bool) {
+    pub fn filter(&mut self, filter: bool) {
+        self.chan.with_disable(|e| {
             // Which of the two config blocks this eic config is in
-            let offset = ($num >> 3) & 0b0001;
-            let config = unsafe { &(*pac::Eic::ptr()).config(offset) };
+            let offset = (P::ChId::ID >> 3) & 0b0001;
+            let config = &e.config(offset);
 
             config.modify(|_, w| {
                 // Which of the eight eic configs in this config block
-                match $num & 0b111 {
+                match P::ChId::ID & 0b111 {
                     0b000 => w.filten0().bit(filter),
                     0b001 => w.filten1().bit(filter),
                     0b010 => w.filten2().bit(filter),
@@ -145,62 +136,158 @@ crate::paste::item! {
                     _ => unreachable!(),
                 }
             });
-        }
+        });
     }
 
-    impl<GPIO: AnyPin> ExternalInterrupt for [<$PadType $num>]<GPIO> {
-        fn id(&self) -> ExternalInterruptID {
-            $num
-        }
+    /// Enable debouncing for this pin, with a configuration appropriate for debouncing physical buttons.
+    pub fn debounce(&mut self) {
+        self.chan.with_disable(|e| {
+            e.dprescaler().modify(|_, w| {
+                w.tickon().set_bit()    // Use the 32k clock for debouncing.
+                .states0().set_bit()    // Require 7 0 samples to see a falling edge.
+                .states1().set_bit()    // Require 7 1 samples to see a rising edge.
+                .prescaler0().div16()
+                .prescaler1().div16()
+            });
+
+            e.debouncen()
+                .modify(|_, w| unsafe { w.bits(P::ChId::ID as u32) });
+        });
     }
-
-    impl<GPIO, C> InputPin for [<$PadType $num>]<GPIO>
-    where
-        GPIO: AnyPin<Mode = Interrupt<C>>,
-        C: InterruptConfig,
-    {
-        type Error = core::convert::Infallible;
-        #[inline]
-        fn is_high(&self) -> Result<bool, Self::Error> {
-            self._pin.is_high()
-        }
-        #[inline]
-        fn is_low(&self) -> Result<bool, Self::Error> {
-            self._pin.is_low()
-        }
-    }
-
-    $(
-        $(#[$attr])*
-        impl<M: PinMode> EicPin for Pin<gpio::$PinType, M> {
-            type Floating = [<$PadType $num>]<Pin<gpio::$PinType, FloatingInterrupt>>;
-            type PullUp = [<$PadType $num>]<Pin<gpio::$PinType, PullUpInterrupt>>;
-            type PullDown = [<$PadType $num>]<Pin<gpio::$PinType, PullDownInterrupt>>;
-
-            fn into_floating_ei(self) -> Self::Floating {
-                [<$PadType $num>]::new(self.into_floating_interrupt())
-            }
-
-            fn into_pull_up_ei(self) -> Self::PullUp {
-                [<$PadType $num>]::new(self.into_pull_up_interrupt())
-            }
-
-            fn into_pull_down_ei(self) -> Self::PullDown {
-                [<$PadType $num>]::new(self.into_pull_down_interrupt())
-            }
-        }
-
-        $(#[$attr])*
-        impl<M: PinMode> ExternalInterrupt for Pin<gpio::$PinType, M>
-        {
-            fn id(&self) -> ExternalInterruptID {
-                $num
-            }
-        }
-    )+
 }
 
+impl<P, C, Id, F> InputPin for ExtInt<P, Id, F>
+where
+    P: EicPin + AnyPin<Mode = Interrupt<C>>,
+    C: InterruptConfig,
+    Id: ChId,
+{
+    type Error = core::convert::Infallible;
+    #[inline]
+    fn is_high(&self) -> Result<bool, Self::Error> {
+        self.pin.is_high()
+    }
+    #[inline]
+    fn is_low(&self) -> Result<bool, Self::Error> {
+        self.pin.is_low()
+    }
+}
+
+#[cfg(feature = "async")]
+mod async_impls {
+    use core::convert::Infallible;
+
+    use embedded_hal_1::digital::ErrorType;
+    use embedded_hal_async::digital::Wait;
+
+    use crate::{
+        async_hal::interrupts::{Binding, Handler, InterruptSource},
+        eic::EicFuture,
+        typelevel::NoneT,
     };
+
+    use super::{
+        super::async_api::{InterruptHandler, WAKERS},
+        *,
+    };
+
+    impl<P, Id> ExtInt<P, Id, NoneT>
+    where
+        P: EicPin,
+        Id: ChId,
+    {
+        /// Turn an EIC pin into a pin usable as a [`Future`](core::future::Future).
+        /// The correct interrupt source is needed.
+        pub fn into_future<I>(self, _irq: I) -> ExtInt<P, Id, EicFuture>
+        where
+            I: Binding<P::InterruptSource, InterruptHandler>,
+            InterruptHandler: Handler<P::InterruptSource>,
+        {
+            P::InterruptSource::unpend();
+            unsafe { P::InterruptSource::enable() };
+
+            ExtInt {
+                pin: self.pin,
+                chan: self.chan.change_mode(),
+            }
+        }
+    }
+
+    impl<P, Id> ExtInt<P, Id, EicFuture>
+    where
+        P: EicPin,
+        Self: InputPin<Error = Infallible>,
+        Id: ChId,
+    {
+        pub async fn wait(&mut self, sense: Sense) {
+            use core::{future::poll_fn, task::Poll};
+            self.disable_interrupt();
+
+            self.sense(sense);
+            poll_fn(|cx| {
+                if self.is_interrupt() {
+                    self.clear_interrupt();
+                    self.disable_interrupt();
+                    self.sense(Sense::None);
+                    return Poll::Ready(());
+                }
+
+                WAKERS[P::ChId::ID].register(cx.waker());
+                self.enable_interrupt();
+
+                if self.is_interrupt() {
+                    self.clear_interrupt();
+                    self.disable_interrupt();
+                    self.sense(Sense::None);
+                    return Poll::Ready(());
+                }
+
+                Poll::Pending
+            })
+            .await;
+        }
+    }
+
+    impl<P, Id> ErrorType for ExtInt<P, Id, EicFuture>
+    where
+        P: EicPin,
+        Self: InputPin<Error = Infallible>,
+        Id: ChId,
+    {
+        type Error = Infallible;
+    }
+
+    impl<P, Id> Wait for ExtInt<P, Id, EicFuture>
+    where
+        P: EicPin,
+        Self: InputPin<Error = Infallible>,
+        Id: ChId,
+    {
+        async fn wait_for_high(&mut self) -> Result<(), Self::Error> {
+            self.wait(Sense::High).await;
+            Ok(())
+        }
+
+        async fn wait_for_low(&mut self) -> Result<(), Self::Error> {
+            self.wait(Sense::Low).await;
+            Ok(())
+        }
+
+        async fn wait_for_rising_edge(&mut self) -> Result<(), Self::Error> {
+            self.wait(Sense::Rise).await;
+            Ok(())
+        }
+
+        async fn wait_for_falling_edge(&mut self) -> Result<(), Self::Error> {
+            self.wait(Sense::Fall).await;
+            Ok(())
+        }
+
+        async fn wait_for_any_edge(&mut self) -> Result<(), Self::Error> {
+            self.wait(Sense::Both).await;
+            Ok(())
+        }
+    }
 }
 
 ei!(ExtInt[0] {

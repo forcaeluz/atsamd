@@ -4,8 +4,9 @@
 //! a set of [`Pads`] for use by the peripheral. Next, you assemble pieces into
 //! a [`Config`] struct. After configuring the peripheral, you then [`enable`]
 //! it, yielding a functional [`Uart`] struct.
-//! Transactions are performed using the [`serial`](embedded_hal::serial) traits
-//! from embedded HAL.
+//! Transactions are performed using the [`embedded_io::Write`],
+//! [`embedded_io::Read`], [`embedded_hal_nb::serial::Write`], and
+//! [`embedded_hal_nb::serial::Read`] traits.
 //!
 //! # [`Pads`]
 //!
@@ -200,11 +201,12 @@
 //!
 //! Only the [`Uart`] struct can actually perform
 //! transactions. To do so, use the embedded HAL traits, like
-//! [`serial::Read`] and [`serial::Write`].
+//! [`embedded_hal_nb::serial::Read`], [`embedded_hal_nb::serial::Write`],
+//! [`embedded_io::Read`], and [`embedded_io::Write`].
 //!
 //! ```
 //! use nb::block;
-//! use embedded_hal::serial::Write;
+//! use atsamd_hal::embedded_hal_nb::serial::Write;
 //!
 //! block!(uart_tx.write(0x0fe));
 //! ```
@@ -265,7 +267,6 @@
 //!
 //! ```
 //! use atsamd_hal::sercom::uart::Uart;
-//! use atsamd_hal::time::*;
 //!
 //! // Assume rx is a Uart<C, RxDuplex> and tx is a Uart<C, TxDuplex>
 //!
@@ -322,8 +323,181 @@
 //! * Synchronous mode (USART) is not supported
 //! * LIN mode is not supported (SAMx5x)
 //! * 32-bit extension mode is not supported (SAMx5x). If you need to transfer
-//!   slices, consider using the DMA methods instead. The `dma` Cargo feature
-//!   must be enabled.
+//!   slices, consider using the DMA methods instead. The <span class="stab
+//!   portability" title="Available on crate feature `dma`
+//!   only"><code>dma</code></span> Cargo feature must be enabled.
+//!
+//! # Using UART with DMA <span class="stab portability" title="Available on crate feature `dma` only"><code>dma</code></span>
+//!
+//! This HAL includes support for DMA-enabled UART transfers. Use
+//! [`Uart::with_rx_channel`] and [`Uart::with_tx_channel`] to attach DMA
+//! channels to the [`Uart`] struct. A DMA-enabled [`Uart`] implements the
+//! blocking [`embedded_io::Write`] and/or [`embedded_io::Read`] traits, which
+//! can be used to perform UART read/writes which are fast, continuous and low
+//! jitter, even if they are preemped by a higher priority interrupt.
+//!
+//!
+//! ```no_run
+//! use atsamd_hal::dmac::channel::{AnyChannel, Ready};
+//! use atsand_hal::sercom::Uart::{I2c, ValidConfig, Error, TxDuplex};
+//! use atsamd_hal::embedded_io::Write;
+//! fn uart_send_with_dma<A: ValidConfig, C: AnyChannel<Status = Ready>>(uart: Uart<A, TxDuplex>, channel: C, bytes: &[u8]) -> Result<(), Error>{
+//!     // Attach a DMA channel
+//!     let uart = uart.with_tx_channel(channel);
+//!     uart.write(bytes)?;
+//! }
+//! ```
+//!
+//! ## Non-blocking DMA transfers
+//!
+//! Non-blocking DMA transfers are also supported.
+//!
+//! The provided [`send_with_dma`] and
+//! [`receive_with_dma`] build and begin a
+//! [`dmac::Transfer`], thus starting the UART
+//! in a non-blocking way. Note that these methods require `'static` buffers in
+//! order to remain memory-safe.
+//!
+//! Optionally, interrupts can be enabled on the provided
+//! [`Channel`]. Please refer to the [`dmac`](crate::dmac) module-level
+//! documentation for more information.
+//!
+//! ```
+//! // Assume channel0 and channel1 are configured `dmac::Channel`s,
+//! // rx is a Uart<C, RxDuplex>, and tx is a Uart<C, TxDuplex>.
+//!
+//! /// Create data to send
+//! let tx_buffer: [u8; 50] = [0xff; 50];
+//! let rx_buffer: [u8; 100] = [0xab; 100];
+//!
+//! // Launch transmit transfer
+//! let tx_dma = tx.send_with_dma(&mut tx_buffer, channel0, |_| {});
+//!
+//! // Launch receive transfer
+//! let rx_dma = rx.receive_with_dma(&mut rx_buffer, channel1, |_| {});
+//!
+//! // Wait for transfers to complete and reclaim resources
+//! let (chan0, tx_buffer, tx) = tx_dma.wait();
+//! let (chan1, rx, rx_buffer) = rx_dma.wait();
+//! ```
+//!
+//! # `async` operation <span class="stab portability" title="Available on crate feature `async` only"><code>async</code></span>
+//!
+//! A [`Uart`] can be used for `async` operations. Configuring a [`Uart`] in
+//! async mode is relatively simple:
+//!
+//! * Bind the corresponding `SERCOM` interrupt source to the UART
+//!   [`InterruptHandler`] (refer to the module-level [`async_hal`]
+//!   documentation for more information).
+//! * Turn a previously configured [`Uart`] into a [`UartFuture`] by calling
+//!   [`Uart::into_future`]
+//! * Optionally, add DMA channels to RX, TX or both using
+//!   [`UartFuture::with_rx_dma_channel`] and
+//!   [`UartFuture::with_tx_dma_channel`]. The API is exactly the same whether
+//!   DMA channels are used or not.
+//! * Use the provided async methods for reading or writing to the UART
+//!   peripheral.
+//!
+//! `UartFuture` implements `AsRef<Uart>` and `AsMut<Uart>` so
+//! that it can be reconfigured using the regular [`Uart`] methods. It also
+//! exposes a [`split`](UartFuture::split) method to split it into its RX and TX
+//! parts.
+//!
+//!  ## Considerations when using `async` [`Uart`] with DMA <span class="stab
+//! portability" title="Available on crate feature `async`
+//! only"><code>async</code></span> <span class="stab portability"
+//! title="Available on crate feature `dma` only"><code>dma</code></span>
+//!
+//! * An [`Uart`] struct must be turned into an [`UartFuture`] by calling
+//!   [`Uart::into_future`] before calling `with_dma_channel`. The DMA channel
+//!   itself must also be configured in async mode by using
+//!   [`DmaController::into_future`](crate::dmac::DmaController::into_future).
+//!   If a DMA channel is added to the [`Uart`] struct before it is turned into
+//!   an [`UartFuture`], it will not be able to use DMA in async mode.
+//!
+//! ```
+//! // This will work
+//! let uart = uart.into_future().with_dma_channels(rx_channel, tx_channel);
+//!
+//! // This won't
+//! let uart = uart.with_dma_channels(rx_channel, tx_channel).into_future();
+//! ```
+//!
+//! ### Safety considerations
+//!
+//! In `async` mode, an SPI+DMA transfer does not require `'static` source and
+//! destination buffers. This, in theory, makes its use `unsafe`. However it is
+//! marked as safe for better ergonomics.
+//!
+//! This means that, as an user, you **must** ensure that the [`Future`]s
+//! returned by the [`read`](UartFuture::read) and [`write`](UartFuture::write)
+//! methods may never be forgotten through [`forget`] or by wrapping them with a
+//! [`ManuallyDrop`].
+//!
+//! The returned futures implement [`Drop`] and will automatically stop any
+//! ongoing transfers; this guarantees that the memory occupied by the
+//! now-dropped buffers may not be corrupted by running transfers.
+//!
+//! This means that using functions like [`futures::select_biased`] to implement
+//! timeouts is safe; transfers will be safely cancelled if the timeout expires.
+//!
+//! This also means that should you [`forget`] this [`Future`] after its
+//! first [`poll`] call, the transfer will keep running, ruining the
+//! now-reclaimed memory, as well as the rest of your day.
+//!
+//! * `await`ing is fine: the [`Future`] will run to completion.
+//! * Dropping an incomplete transfer is also fine. Dropping can happen, for
+//!   example, if the transfer doesn't complete before a timeout expires.
+//! * Dropping an incomplete transfer *without running its destructor* is
+//!   **unsound** and will trigger undefined behavior.
+//!
+//! ```ignore
+//! async fn always_ready() {}
+//!
+//! let mut buffer = [0x00; 10];
+//!
+//! // This is completely safe
+//! uart.read(&mut buffer).await?;
+//!
+//! // This is also safe: we launch a transfer, which is then immediately cancelled
+//! futures::select_biased! {
+//!     _ = uart.read(&mut buffer)?,
+//!     _ = always_ready(),
+//! }
+//!
+//! // This, while contrived, is also safe.
+//! {
+//!     use core::future::Future;
+//!
+//!     let future = uart.read(&mut buffer);
+//!     futures::pin_mut!(future);
+//!     // Assume ctx is a `core::task::Context` given out by the executor.
+//!     // The future is polled, therefore starting the transfer
+//!     future.as_mut().poll(ctx);
+//!
+//!     // Future is dropped here - transfer is cancelled.
+//! }
+//!
+//! // DANGER: This is an example of undefined behavior
+//! {
+//!     use core::future::Future;
+//!     use core::ops::DerefMut;
+//!
+//!     let future = core::mem::ManuallyDrop::new(uart.read(&mut buffer));
+//!     futures::pin_mut!(future);
+//!     // To actually make this example compile, we would need to wrap the returned
+//!     // future from `i2c.read()` in a newtype that implements Future, because we
+//!     // can't actually call as_mut() without being able to name the type we want
+//!     // to deref to.
+//!     let future_ref: &mut SomeNewTypeFuture = &mut future.as_mut();
+//!     future.as_mut().poll(ctx);
+//!
+//!     // Future is NOT dropped here - transfer is not cancelled, resulting un UB.
+//! }
+//! ```
+//!
+//! As you can see, unsoundness is relatively hard to come by - however, caution
+//! should still be exercised.
 //!
 //! [`enable`]: Config::enable
 //! [`disable`]: Uart::disable
@@ -338,49 +512,15 @@
 //! [`NoneT`]: crate::typelevel::NoneT
 //! [`serial::Write`]: embedded_hal::serial::Write
 //! [`serial::Read`]: embedded_hal::serial::Read
-#![cfg_attr(
-    feature = "dma",
-    doc = "
-# Using UART with DMA
-
-This HAL includes support for DMA-enabled UART transfers. [`Uart`]
-implements the DMAC [`Buffer`]
-trait. The provided [`send_with_dma`] and
-[`receive_with_dma`] build and begin a
-[`dmac::Transfer`], thus starting the UART
-in a non-blocking way. Optionally, interrupts can be enabled on the provided
-[`Channel`]. Note that the `dma` feature must
-be enabled. Please refer to the [`dmac`](crate::dmac) module-level
-documentation for more information.
-
-```
-// Assume channel0 and channel1 are configured `dmac::Channel`s,
-// rx is a Uart<C, RxDuplex>, and tx is a Uart<C, TxDuplex>.
-
-/// Create data to send
-let tx_buffer: [u8; 50] = [0xff; 50];
-let rx_buffer: [u8; 100] = [0xab; 100];
-
-// Launch transmit transfer
-let tx_dma = tx.send_with_dma(&mut tx_buffer, channel0, |_| {});
-
-// Launch receive transfer
-let rx_dma = rx.receive_with_dma(&mut rx_buffer, channel1, |_| {});
-
-// Wait for transfers to complete and reclaim resources
-let (chan0, tx_buffer, tx) = tx_dma.wait();
-let (chan1, rx, rx_buffer) = rx_dma.wait();
-```
-
-[`Buffer`]: crate::dmac::transfer::Buffer
-[`send_with_dma`]: Uart::send_with_dma
-[`receive_with_dma`]: Uart::receive_with_dma
-[`dmac::Transfer`]: crate::dmac::Transfer
-[`Channel`]: crate::dmac::channel::Channel
-[`dmac`]: crate::dmac
-
-"
-)]
+//! [`receive_with_dma`]: Self::receive_with_dma
+//! [`send_with_dma`]: Self::send_with_dma
+//! [`dmac::Transfer`]: crate::dmac::Transfer
+//! [`Channel`]: crate::dmac::Channel
+//! [`async_hal`]: crate::async_hal
+//! [`forget`]: core::mem::forget
+//! [`ManuallyDrop`]: core::mem::ManuallyDrop
+//! [`Future`]: core::future::Future
+//! [`poll`]: core::future::Future::poll
 
 use atsamd_hal_macros::{hal_cfg, hal_module};
 
@@ -406,7 +546,15 @@ pub use config::*;
 
 pub mod impl_ehal;
 
-use crate::{sercom::pad::SomePad, typelevel::Sealed};
+#[cfg(feature = "async")]
+mod async_api;
+#[cfg(feature = "async")]
+pub use async_api::*;
+
+use crate::{
+    sercom::pad::SomePad,
+    typelevel::{NoneT, Sealed},
+};
 use core::marker::PhantomData;
 use num_traits::AsPrimitive;
 
@@ -502,6 +650,10 @@ pub trait Receive: Capability {}
 /// capability, but not both
 pub trait Simplex: Capability {}
 
+/// Type-level enum representing a UART that is *not* half of a split
+/// [`Duplex`]
+pub trait SingleOwner: Capability {}
+
 /// Marker type representing a UART that has both transmit and receive
 /// capability
 pub enum Duplex {}
@@ -518,6 +670,7 @@ impl Capability for Duplex {
 }
 impl Receive for Duplex {}
 impl Transmit for Duplex {}
+impl SingleOwner for Duplex {}
 
 /// Marker type representing a UART that can only receive
 pub enum Rx {}
@@ -534,6 +687,7 @@ impl Capability for Rx {
 }
 impl Receive for Rx {}
 impl Simplex for Rx {}
+impl SingleOwner for Rx {}
 
 /// Marker type representing a UART that can only transmit
 pub enum Tx {}
@@ -550,6 +704,7 @@ impl Capability for Tx {
 }
 impl Transmit for Tx {}
 impl Simplex for Tx {}
+impl SingleOwner for Tx {}
 
 /// Marker type representing the Rx half of a  [`Duplex`] UART
 pub enum RxDuplex {}
@@ -594,16 +749,18 @@ impl Transmit for TxDuplex {}
 /// * [`Duplex`]: Can perform receive and transmit transactions. Additionally,
 ///   you can call [`split`](Uart::split) to return a `(Uart<C, RxDuplex>,
 ///   Uart<C, TxDuplex>)` tuple.
-pub struct Uart<C, D>
+pub struct Uart<C, D, RxDma = NoneT, TxDma = NoneT>
 where
     C: ValidConfig,
     D: Capability,
 {
     config: C,
     capability: PhantomData<D>,
+    rx_channel: RxDma,
+    tx_channel: TxDma,
 }
 
-impl<C, D> Uart<C, D>
+impl<C, D, R, T> Uart<C, D, R, T>
 where
     C: ValidConfig,
     D: Capability,
@@ -653,8 +810,8 @@ where
     /// * Since [`Duplex`] [`Uart`]s are [`Receive`] + [`Transmit`] they have
     ///   all flags available.
     ///
-    /// **Warning:** The implementation of of
-    /// [`Write::flush`](embedded_hal::serial::Write::flush) waits on and
+    /// **Warning:** The implementations of of
+    /// [`Write::flush`](embedded_hal_nb::serial::Write::flush) waits on and
     /// clears the `TXC` flag. Manually clearing this flag could cause it to
     /// hang indefinitely.
     #[inline]
@@ -738,7 +895,7 @@ where
     }
 }
 
-impl<C, D> Uart<C, D>
+impl<C, D, R, T> Uart<C, D, R, T>
 where
     C: ValidConfig,
     <C::Pads as PadSet>::Cts: SomePad,
@@ -775,7 +932,7 @@ where
     }
 }
 
-impl<C, D> Uart<C, D>
+impl<C, D, R, T> Uart<C, D, R, T>
 where
     C: ValidConfig,
     D: Simplex,
@@ -807,22 +964,117 @@ where
     }
 }
 
-impl<C> Uart<C, Duplex>
+#[cfg(feature = "dma")]
+impl<C, D, T> Uart<C, D, NoneT, T>
+where
+    C: ValidConfig,
+    D: Capability,
+{
+    /// Attach a DMA channel to this [`Uart`] for RX transactions. Its
+    /// [`Read`](embedded_io::Read) implementation will use DMA to
+    /// carry out its transactions.
+    pub fn with_rx_channel<R: crate::dmac::AnyChannel<Status = crate::dmac::Ready>>(
+        self,
+        rx_channel: R,
+    ) -> Uart<C, D, R, T> {
+        Uart {
+            config: self.config,
+            capability: self.capability,
+            tx_channel: self.tx_channel,
+            rx_channel,
+        }
+    }
+}
+
+#[cfg(feature = "dma")]
+impl<C, D, R> Uart<C, D, R, NoneT>
+where
+    C: ValidConfig,
+    D: Capability,
+{
+    /// Attach a DMA channel to this [`Uart`] for TX transactions. Its
+    /// [`Write`](embedded_io::Write) implementation will use DMA to
+    /// carry out its transactions.
+    pub fn with_tx_channel<T: crate::dmac::AnyChannel<Status = crate::dmac::Ready>>(
+        self,
+        tx_channel: T,
+    ) -> Uart<C, D, R, T> {
+        Uart {
+            config: self.config,
+            capability: self.capability,
+            rx_channel: self.rx_channel,
+            tx_channel,
+        }
+    }
+}
+
+#[cfg(feature = "dma")]
+impl<C, D, R, T, S> Uart<C, D, R, T>
+where
+    C: ValidConfig,
+    D: Capability,
+    R: crate::dmac::AnyChannel<Status = S>,
+    S: crate::dmac::ReadyChannel,
+{
+    /// Reclaim the RX DMA channel. Subsequent RX operations will no longer use
+    /// DMA.
+    pub fn take_rx_channel(self) -> (Uart<C, D, NoneT, T>, R) {
+        (
+            Uart {
+                config: self.config,
+                capability: self.capability,
+                tx_channel: self.tx_channel,
+                rx_channel: NoneT,
+            },
+            self.rx_channel,
+        )
+    }
+}
+
+#[cfg(feature = "dma")]
+impl<C, D, R, T, S> Uart<C, D, R, T>
+where
+    C: ValidConfig,
+    D: Capability,
+    T: crate::dmac::AnyChannel<Status = S>,
+    S: crate::dmac::ReadyChannel,
+{
+    /// Reclaim the TX DMA channel. Subsequent TX operations will no longer use
+    /// DMA.
+    pub fn take_tx_channel(self) -> (Uart<C, D, R, NoneT>, T) {
+        (
+            Uart {
+                config: self.config,
+                capability: self.capability,
+                rx_channel: self.rx_channel,
+                tx_channel: NoneT,
+            },
+            self.tx_channel,
+        )
+    }
+}
+
+impl<C, R, T> Uart<C, Duplex, R, T>
 where
     C: ValidConfig,
 {
     /// Split the [`Uart`] into [`RxDuplex`] and [`TxDuplex`] halves
+    #[allow(clippy::type_complexity)]
     #[inline]
-    pub fn split(self) -> (Uart<C, RxDuplex>, Uart<C, TxDuplex>) {
+    pub fn split(self) -> (Uart<C, RxDuplex, R, NoneT>, Uart<C, TxDuplex, NoneT, T>) {
         let config = unsafe { core::ptr::read(&self.config) };
         (
             Uart {
                 config: self.config,
                 capability: PhantomData,
+                rx_channel: self.rx_channel,
+                tx_channel: NoneT,
             },
             Uart {
                 config,
                 capability: PhantomData,
+                rx_channel: NoneT,
+                tx_channel: self.tx_channel,
             },
         )
     }
@@ -855,21 +1107,28 @@ where
 
     /// Join [`RxDuplex`] and [`TxDuplex`] halves back into a full `Uart<C,
     /// Duplex>`
-    pub fn join(rx: Uart<C, RxDuplex>, _tx: Uart<C, TxDuplex>) -> Self {
+    pub fn join(rx: Uart<C, RxDuplex, R, NoneT>, tx: Uart<C, TxDuplex, NoneT, T>) -> Self {
         Self {
             config: rx.config,
             capability: PhantomData,
+            rx_channel: rx.rx_channel,
+            tx_channel: tx.tx_channel,
         }
     }
 }
 
-impl<C: ValidConfig> AsMut<Uart<C, Duplex>> for (&mut Uart<C, RxDuplex>, &mut Uart<C, TxDuplex>) {
+impl<C: ValidConfig, R, T> AsMut<Uart<C, Duplex, R, T>>
+    for (
+        &mut Uart<C, RxDuplex, R, NoneT>,
+        &mut Uart<C, TxDuplex, NoneT, T>,
+    )
+{
     #[inline]
-    fn as_mut(&mut self) -> &mut Uart<C, Duplex> {
+    fn as_mut(&mut self) -> &mut Uart<C, Duplex, R, T> {
         // SAFETY: Pointer casting &mut Uart<C, RxDuplex> into &mut
-        // Uart<C, Duplex> should be safe as long as RxDuplex and Duplex
-        // both only have one nonzero-sized field.
-        unsafe { &mut *(self.0 as *mut _ as *mut Uart<C, Duplex>) }
+        // Uart<C, Duplex> should be safe as long as RxDuplex, TxDuplex, R and T are all
+        // zero-sized types
+        unsafe { &mut *(self.0 as *mut _ as *mut Uart<C, Duplex, R, T>) }
     }
 }
 
@@ -888,7 +1147,7 @@ where
 // Rx/Tx specific functionality
 //=============================================================================
 
-impl<C, D> Uart<C, D>
+impl<C, D, R, T> Uart<C, D, R, T>
 where
     C: ValidConfig,
     D: Receive,
@@ -926,13 +1185,14 @@ where
     #[inline]
     pub fn flush_rx_buffer(&mut self) {
         // TODO Is this a hardware bug???
-        /*
-        usart.ctrlb.modify(|_, w| w.rxen().clear_bit());
-        while usart.syncbusy.read().ctrlb().bit() || usart.ctrlb.read().rxen().bit_is_set() {}
 
-        usart.ctrlb.modify(|_, w| w.rxen().set_bit());
-        while usart.syncbusy.read().ctrlb().bit() || usart.ctrlb.read().rxen().bit_is_clear() {}
-        */
+        // usart.ctrlb.modify(|_, w| w.rxen().clear_bit());
+        // while usart.syncbusy.read().ctrlb().bit() ||
+        // usart.ctrlb.read().rxen().bit_is_set() {}
+
+        // usart.ctrlb.modify(|_, w| w.rxen().set_bit());
+        // while usart.syncbusy.read().ctrlb().bit() ||
+        // usart.ctrlb.read().rxen().bit_is_clear() {}
 
         for _ in 0..=2 {
             let _data = unsafe { self.config.as_mut().registers.read_data() };
@@ -945,7 +1205,7 @@ where
     }
 }
 
-impl<C, D> Uart<C, D>
+impl<C, D, R, T> Uart<C, D, R, T>
 where
     C: ValidConfig,
     D: Transmit,

@@ -13,13 +13,12 @@
 use crate::{
     clock::v2::{
         ahb::{AhbClk, AhbId},
-        gclk::Gclk0Id,
         pclk::{Pclk, PclkId, PclkSourceId},
         types::Can0,
         Source,
     },
     gpio::*,
-    typelevel::{Decrement, Increment},
+    typelevel::{Decrement, Increment, Sealed},
 };
 use atsamd_hal_macros::hal_cfg;
 
@@ -49,7 +48,7 @@ impl<ID: PclkId + AhbId, PS: PclkSourceId, RX, TX, CAN> Dependencies<ID, PS, RX,
     /// This struct implements [`mcan_core::Dependencies`] trait, making it
     /// possible to construct an instance of `mcan::bus::CanConfigurable`.
     pub fn new<S>(
-        gclk0: S,
+        gclk: S,
         pclk: Pclk<ID, PS>,
         ahbclk: AhbClk<ID>,
         rx: RX,
@@ -57,27 +56,27 @@ impl<ID: PclkId + AhbId, PS: PclkSourceId, RX, TX, CAN> Dependencies<ID, PS, RX,
         can: CAN,
     ) -> (Self, S::Inc)
     where
-        S: Source<Id = Gclk0Id> + Increment,
+        S: Source + Increment,
     {
         (
             Self {
                 pclk,
-                host_freq: gclk0.freq(),
+                host_freq: gclk.freq(),
                 ahbclk,
                 rx,
                 tx,
                 can,
             },
-            gclk0.inc(),
+            gclk.inc(),
         )
     }
     /// Destroy an instance of `Dependencies` struct.
     ///
     /// Releases all enclosed objects back to the user.
     #[allow(clippy::type_complexity)]
-    pub fn free<S>(self, gclk0: S) -> (Pclk<ID, PS>, HertzU32, AhbClk<ID>, RX, TX, CAN, S::Dec)
+    pub fn free<S>(self, gclk: S) -> (Pclk<ID, PS>, HertzU32, AhbClk<ID>, RX, TX, CAN, S::Dec)
     where
-        S: Source<Id = Gclk0Id> + Decrement,
+        S: Source + Decrement,
     {
         let Self {
             pclk,
@@ -87,7 +86,7 @@ impl<ID: PclkId + AhbId, PS: PclkSourceId, RX, TX, CAN> Dependencies<ID, PS, RX,
             tx,
             can,
         } = self;
-        (pclk, host_freq, ahbclk, rx, tx, can, gclk0.dec())
+        (pclk, host_freq, ahbclk, rx, tx, can, gclk.dec())
     }
 }
 
@@ -121,24 +120,30 @@ unsafe impl CanId for Can1 {
     const ADDRESS: *const () = crate::pac::Can1::PTR as *const _;
 }
 
-trait OwnedPeripheral {
+/// Trait representing a CAN peripheral
+pub trait OwnedPeripheral: Sealed {
     type Represents: CanId;
 }
 
+impl Sealed for crate::pac::Can0 {}
 impl OwnedPeripheral for crate::pac::Can0 {
     type Represents = Can0;
 }
 
 #[hal_cfg("can1")]
+impl Sealed for crate::pac::Can1 {}
+#[hal_cfg("can1")]
 impl OwnedPeripheral for crate::pac::Can1 {
     type Represents = Can1;
 }
 
-trait RxPin {
+/// Trait implemented on pins that can be set as RX pins for CAN
+pub trait RxPin: Sealed {
     type ValidFor: CanId;
 }
 
-trait TxPin {
+/// Trait implemented on pins that can be set as TX pins for CAN
+pub trait TxPin: Sealed {
     type ValidFor: CanId;
 }
 

@@ -136,13 +136,12 @@
 //! parameter, representing the underlying [`Config`].
 //!
 //! Only the [`I2c`] struct can actually perform
-//! transactions. To do so, use the embedded HAL traits, like
-//! [`i2c::WriteRead`], [`i2c::Read`] and [`i2c::Write`].
+//! transactions. To do so, use the [`embedded_hal::i2c::I2c`] trait.
 //!
 //! ```
-//! use embedded_hal::blocking::i2c::Write;
+//! use embedded_hal::i2c::I2c;
 //!
-//! i2c.write(0x54, 0x0fe)
+//! i2c.write(0x54, 0x0fe).unwrap();
 //! ```
 //!
 //! # Reading the current configuration
@@ -163,7 +162,6 @@
 //!
 //! ```no_run
 //! use atsamd_hal::sercom::i2c::I2c;
-//! use atsamd_hal::time::*;
 //!
 //! // Assume config is a valid Duplex I2C Config struct
 //! let i2c = config.enable();
@@ -183,8 +181,170 @@
 //! * High-speed mode is not supported.
 //! * 4-wire mode is not supported.
 //! * 32-bit extension mode is not supported (SAMx5x). If you need to transfer
-//!   slices, consider using the DMA methods instead. The `dma` Cargo feature
-//!   must be enabled.
+//!   slices, consider using the DMA methods instead <span class="stab
+//!   portability" title="Available on crate feature `dma`
+//!   only"><code>dma</code></span>.
+//!
+//! # Using I2C with DMA <span class="stab portability" title="Available on crate feature `dma` only"><code>dma</code></span>
+//!
+//! This HAL includes support for DMA-enabled I2C transfers. Use
+//! [`I2c::with_dma_channel`] to attach a DMA channel to the [`I2c`] struct. A
+//! DMA-enabled [`I2c`] implements the blocking
+//! [`embedded_hal::i2c::I2c`](crate::ehal::i2c::I2c) trait, which can be used
+//! to perform I2C transfers which are fast, continuous and low jitter, even
+//! if they are preemped by a higher priority interrupt.
+//!
+//!
+//! ```no_run
+//! use atsamd_hal::dmac::channel::{AnyChannel, Ready};
+//! use atsand_hal::sercom::i2c::{I2c, AnyConfig, Error};
+//! use atsamd_hal::embedded_hal::i2c::I2c;
+//! fn i2c_write_with_dma<A: AnyConfig, C: AnyChannel<Status = Ready>>(i2c: I2c<A>, channel: C, bytes: &[u8]) -> Result<(), Error>{
+//!     // Attach a DMA channel
+//!     let i2c = i2c.with_dma_channel(channel);
+//!     i2c.write(0x54, bytes)?;
+//! }
+//! ```
+//!
+//! ## Limitations of using DMA with I2C
+//!
+//! * The I2C peripheral only supports continuous DMA read/writes of up to 255
+//!   bytes. Trying to read/write with a transfer of 256 bytes or more will
+//!   result in a panic. This also applies to using [`I2c::transaction`] with
+//!   adjacent write/read operations of the same type; the total number of bytes
+//!   across all adjacent operations must not exceed 256. If you need continuous
+//!   transfers of 256 bytes or more, use the non-DMA [`I2c`] implementations.
+//!
+//! * When using [`I2c::transaction`] or [`I2c::write_read`], the
+//!   [`embedded_hal::i2c::I2c`] specification mandates that a REPEATED START
+//!   (instead of a STOP+START) is sent between transactions of a different type
+//!   (read/write). Unfortunately, in DMA mode, the hardware is only capable of
+//!   sending STOP+START. If you absolutely need repeated starts, the only
+//!   workaround is to use the I2C without DMA.
+//!
+//! * Using [`I2c::transaction`] consumes significantly more memory than the
+//!   other methods provided by [`embedded_hal::i2c::I2c`] (at least 256 bytes
+//!   extra).
+//!
+//! * When using [`I2c::transaction`], up to 17 adjacent operations of the same
+//!   type can be continuously handled by DMA without CPU intervention. If you
+//!   need more than 17 adjacent operations of the same type, the transfer will
+//!   reverted to using the byte-by-byte (non-DMA) implementation.
+//!
+//! All these limitations also apply to I2C transfers in async mode when using
+//! DMA. They do not apply to I2C transfers in async mode when not using DMA.
+//!
+//! # `async` operation <span class="stab portability" title="Available on crate feature `async` only"><code>async</code></span>
+//!
+//! An [`I2c`] can be used for
+//! `async` operations. Configuring an [`I2c`] in async mode is relatively
+//! simple:
+//!
+//! * Bind the corresponding `SERCOM` interrupt source to the SPI
+//!   [`InterruptHandler`] (refer to the module-level [`async_hal`]
+//!   documentation for more information).
+//! * Turn a previously configured [`I2c`] into an [`I2cFuture`] by calling
+//!   [`I2c::into_future`]
+//! * Optionally, add a DMA channel by using [`I2cFuture::with_dma_channel`].
+//!   The API is exactly the same whether a DMA channel is used or not.
+//! * Use the provided async methods for reading or writing to the I2C
+//!   peripheral. [`I2cFuture`] implements [`embedded_hal_async::i2c::I2c`].
+//!
+//! `I2cFuture` implements `AsRef<I2c>` and `AsMut<I2c>` so
+//! that it can be reconfigured using the regular [`I2c`] methods.
+//!
+//! ## Considerations when using `async` [`I2c`] with DMA <span class="stab portability" title="Available on crate feature `async` only"><code>async</code></span> <span class="stab portability" title="Available on crate feature `dma` only"><code>dma</code></span>
+//!
+//! * An [`I2c`] struct must be turned into an [`I2cFuture`] by calling
+//!   [`I2c::into_future`] before calling `with_dma_channel`. The DMA channel
+//!   itself must also be configured in async mode by using
+//!   [`DmaController::into_future`](crate::dmac::DmaController::into_future).
+//!   If a DMA channel is added to the [`I2c`] struct before it is turned into
+//!   an [`I2cFuture`], it will not be able to use DMA in async mode.
+//!
+//! ```
+//! // This will work
+//! let i2c = i2c.into_future().with_dma_channel(channel);
+//!
+//! // This won't
+//! let i2c = i2c.with_dma_channel(channel).into_future();
+//! ```
+//!
+//! ### Safety considerations
+//!
+//! In `async` mode, an I2C+DMA transfer does not require `'static` source and
+//! destination buffers. This, in theory, makes its use `unsafe`. However it is
+//! marked as safe for better ergonomics, and to enable the implementation of
+//! the [`embedded_hal_async::i2c::I2c`] trait.
+//!
+//! This means that, as an user, you **must** ensure that the [`Future`]s
+//! returned by the [`embedded_hal_async::i2c::I2c`] methods may never be
+//! forgotten through [`forget`] or by wrapping them with a [`ManuallyDrop`].
+//!
+//! The returned futures implement [`Drop`] and will automatically stop any
+//! ongoing transfers; this guarantees that the memory occupied by the
+//! now-dropped buffers may not be corrupted by running transfers.
+//!
+//! This means that using functions like [`futures::select_biased`] to implement
+//! timeouts is safe; transfers will be safely cancelled if the timeout expires.
+//!
+//! This also means that should you [`forget`] this [`Future`] after its
+//! first [`poll`] call, the transfer will keep running, ruining the
+//! now-reclaimed memory, as well as the rest of your day.
+//!
+//! * `await`ing is fine: the [`Future`] will run to completion.
+//! * Dropping an incomplete transfer is also fine. Dropping can happen, for
+//!   example, if the transfer doesn't complete before a timeout expires.
+//! * Dropping an incomplete transfer *without running its destructor* is
+//!   **unsound** and will trigger undefined behavior.
+//!
+//! ```ignore
+//! async fn always_ready() {}
+//!
+//! let mut buffer = [0x00; 10];
+//!
+//! // This is completely safe
+//! i2c.read(&mut buffer).await?;
+//!
+//! // This is also safe: we launch a transfer, which is then immediately cancelled
+//! futures::select_biased! {
+//!     _ = i2c.read(&mut buffer)?,
+//!     _ = always_ready(),
+//! }
+//!
+//! // This, while contrived, is also safe.
+//! {
+//!     use core::future::Future;
+//!
+//!     let future = i2c.read(&mut buffer);
+//!     futures::pin_mut!(future);
+//!     // Assume ctx is a `core::task::Context` given out by the executor.
+//!     // The future is polled, therefore starting the transfer
+//!     future.as_mut().poll(ctx);
+//!
+//!     // Future is dropped here - transfer is cancelled.
+//! }
+//!
+//! // DANGER: This is an example of undefined behavior
+//! {
+//!     use core::future::Future;
+//!     use core::ops::DerefMut;
+//!
+//!     let future = core::mem::ManuallyDrop::new(i2c.read(&mut buffer));
+//!     futures::pin_mut!(future);
+//!     // To actually make this example compile, we would need to wrap the returned
+//!     // future from `i2c.read()` in a newtype that implements Future, because we
+//!     // can't actually call as_mut() without being able to name the type we want
+//!     // to deref to.
+//!     let future_ref: &mut SomeNewTypeFuture = &mut future.as_mut();
+//!     future.as_mut().poll(ctx);
+//!
+//!     // Future is NOT dropped here - transfer is not cancelled, resulting un UB.
+//! }
+//! ```
+//!
+//! As you can see, unsoundness is relatively hard to come by - however, caution
+//! should still be exercised.
 //!
 //! [`enable`]: Config::enable
 //! [`disable`]: I2c::disable
@@ -199,61 +359,14 @@
 //! [`Pin`]: crate::gpio::pin::Pin
 //! [`PinId`]: crate::gpio::pin::PinId
 //! [`PinMode`]: crate::gpio::pin::PinMode
-//! [`i2c::Write`]: embedded_hal::blocking::i2c::Write
-//! [`i2c::Read`]: embedded_hal::blocking::i2c::Read
-//! [`i2c::WriteRead`]: embedded_hal::blocking::i2c::WriteRead
-#![cfg_attr(
-    feature = "dma",
-    doc = "
-# Using I2C with DMA
-
-This HAL includes support for DMA-enabled I2C transfers. [`I2c`]
-implements the DMAC [`Buffer`]
-trait. The provided [`send_with_dma`] and
-[`receive_with_dma`] build and begin a
-[`dmac::Transfer`], thus starting the I2C
-in a non-blocking way.
-
-Note that the [`init_dma_transfer`] method should be called immediately before
-starting a DMA transfer with I2C. This will check that the bus is in a correct
-state before starting the transfer, and providing a token type to pass to the
-[`send_with_dma`] and [`receive_with_dma`] methods.
-
-Optionally, interrupts can be enabled on the provided
-[`Channel`]. Note that the `dma` feature must
-be enabled. Please refer to the [`dmac`](crate::dmac) module-level
-documentation for more information.
-
-```no_run
-use atsamd_hal::dmac::channel::{AnyChannel, Ready};
-use atsand_hal::sercom::i2c::{I2c, AnyConfig, Error};
-fn i2c_send_with_dma<A: AnyConfig, C: AnyChannel<Status = Ready>>(i2c: I2c<A>, channel: C) -> Result<(), Error>{
-    // Create data to send. Note that it must be `'static`.
-    let buffer: [u8; 50] = [0xff; 50];
-
-    // Initialize the bus and check for errors
-    let token = i2c.init_dma_transfer()?;
-    let transfer = i2c.send_with_dma(0x54, token, buffer, channel0, |_| {})
-
-
-    // Wait for transfers to complete and reclaim resources
-    let (chan0, buffer, i2c) = transfer.wait();
-
-    // Check for errors that may have occured during the transfer.
-    i2c.read_status().check_bus_error()?;
-}
-```
-
-[`Buffer`]: crate::dmac::transfer::Buffer
-[`init_dma_transfer`]: I2c::init_dma_transfer
-[`send_with_dma`]: I2c::send_with_dma
-[`receive_with_dma`]: I2c::receive_with_dma
-[`dmac::Transfer`]: crate::dmac::Transfer
-[`Channel`]: crate::dmac::channel::Channel
-[`dmac`]: crate::dmac
-
-"
-)]
+//! [`embedded_hal::i2c::I2c`]: crate::ehal::i2c::I2c
+//! [`I2c::transaction`]: crate::ehal::i2c::I2c::transaction
+//! [`I2c::write_read`]: crate::ehal::i2c::I2c::write_read
+//! [`async_hal`]: crate::async_hal
+//! [`forget`]: core::mem::forget
+//! [`ManuallyDrop`]: core::mem::ManuallyDrop
+//! [`Future`]: core::future::Future
+//! [`poll`]: core::future::Future::poll
 
 use atsamd_hal_macros::hal_module;
 
@@ -276,6 +389,12 @@ pub use config::*;
 
 mod impl_ehal;
 
+#[cfg(feature = "async")]
+mod async_api;
+
+#[cfg(feature = "async")]
+pub use async_api::*;
+
 /// Word size for an I2C message
 pub type Word = u8;
 
@@ -294,11 +413,12 @@ pub enum InactiveTimeout {
 }
 
 /// Abstraction over a I2C peripheral, allowing to perform I2C transactions.
-pub struct I2c<C: AnyConfig> {
+pub struct I2c<C: AnyConfig, D = crate::typelevel::NoneT> {
     config: C,
+    _dma_channel: D,
 }
 
-impl<C: AnyConfig> I2c<C> {
+impl<C: AnyConfig, D> I2c<C, D> {
     /// Obtain a pointer to the `DATA` register. Necessary for DMA transfers.
     #[inline]
     pub fn data_ptr(&self) -> *mut Word {
@@ -429,6 +549,43 @@ impl<C: AnyConfig> I2c<C> {
         let mut config = self.config;
         config.as_mut().registers.disable();
         config
+    }
+}
+
+impl<C: AnyConfig> I2c<C> {
+    /// Attach a DMA channel to this [`I2c`]. Its
+    /// [`embedded_hal::i2c::I2c`](crate::ehal::i2c::I2c) implementation will
+    /// use DMA to carry out its transactions.
+    #[cfg(feature = "dma")]
+    #[inline]
+    pub fn with_dma_channel<Chan: crate::dmac::AnyChannel<Status = crate::dmac::Ready>>(
+        self,
+        channel: Chan,
+    ) -> I2c<C, Chan> {
+        I2c {
+            config: self.config,
+            _dma_channel: channel,
+        }
+    }
+}
+
+#[cfg(feature = "dma")]
+impl<C, D, S> I2c<C, D>
+where
+    C: AnyConfig,
+    D: crate::dmac::AnyChannel<Status = S>,
+    S: crate::dmac::ReadyChannel,
+{
+    /// Reclaim the DMA channel. Any subsequent I2C operations will no longer
+    /// use DMA.
+    pub fn take_dma_channel(self) -> (I2c<C, crate::typelevel::NoneT>, D) {
+        (
+            I2c {
+                config: self.config,
+                _dma_channel: crate::typelevel::NoneT,
+            },
+            self._dma_channel,
+        )
     }
 }
 

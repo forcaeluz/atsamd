@@ -1,5 +1,3 @@
-#![allow(unused_braces)]
-
 //! # Direct Memory Access Controller
 //!
 //! This library provides a type-safe API with compile-time guarantees
@@ -101,9 +99,9 @@
 //! stack-allocated buffers for reuse while the DMAC is still writing to/reading
 //! from them! Needless to say that is very unsafe.
 //! Refer [here](https://docs.rust-embedded.org/embedonomicon/dma.html#memforget)
-//! or [here](https://blog.japaric.io/safe-dma/) for more information. You may choose to forego
-//! the `'static` lifetimes by using the unsafe API and the
-//! [`Transfer::new_unchecked`](transfer::Transfer::new_unchecked) method.
+//! or [here](https://blog.japaric.io/safe-dma/#leakpocalypse) for more information.
+//! You may choose to forgo the `'static` lifetimes by using the unsafe API and
+//! the [`Transfer::new_unchecked`](transfer::Transfer::new_unchecked) method.
 //!
 //! # Unsafe API
 //!
@@ -117,7 +115,7 @@
 //! `Drop` implementation is offered for `Transfer`s.
 //!
 //! Additionally, you can (unsafely) implement your own buffer types through the
-//! unsafe [`Buffer`](transfer::Buffer) trait.
+//! unsafe [`Buffer`] trait.
 //!
 //! # Example
 //! ```
@@ -253,8 +251,6 @@
 
 use atsamd_hal_macros::hal_cfg;
 
-use modular_bitfield::prelude::*;
-
 pub use channel::*;
 pub use dma_controller::*;
 pub use transfer::*;
@@ -274,6 +270,26 @@ pub enum Error {
 
     /// Operation is not valid in the current state of the object.
     InvalidState,
+    /// Chip reported an error during transfer
+    TransferError,
+}
+
+impl From<Error> for crate::sercom::spi::Error {
+    fn from(value: Error) -> Self {
+        crate::sercom::spi::Error::Dma(value)
+    }
+}
+
+impl From<Error> for crate::sercom::i2c::Error {
+    fn from(value: Error) -> Self {
+        crate::sercom::i2c::Error::Dma(value)
+    }
+}
+
+impl From<Error> for crate::sercom::uart::Error {
+    fn from(value: Error) -> Self {
+        crate::sercom::uart::Error::Dma(value)
+    }
 }
 
 /// Result for DMAC operations
@@ -342,70 +358,173 @@ macro_rules! get {
 /// Number of DMA channels used by the driver
 pub const NUM_CHANNELS: usize = with_num_channels!(get);
 
-// ----- DMAC SRAM registers ----- //
-impl Default for BlockTransferControl {
-    fn default() -> Self {
-        Self::new()
+/// DMAC SRAM registers
+pub(crate) mod sram {
+    #![allow(dead_code, unused_braces)]
+
+    use core::cell::UnsafeCell;
+
+    use super::{BeatSize, NUM_CHANNELS};
+
+    use modular_bitfield::{
+        bitfield,
+        specifiers::{B2, B3},
+    };
+
+    /// Wrapper type around a [`DmacDescriptor`] to allow interior mutability
+    /// while keeping them in static storage
+    #[repr(transparent)]
+    pub struct DescriptorCell(UnsafeCell<DmacDescriptor>);
+
+    impl DescriptorCell {
+        const fn default() -> Self {
+            Self(UnsafeCell::new(DmacDescriptor::default()))
+        }
+    }
+
+    // DescriptorCell is not not *really* sync; we must manually uphold the sync
+    // guarantees on every access.
+    unsafe impl Sync for DescriptorCell {}
+
+    impl core::ops::Deref for DescriptorCell {
+        type Target = UnsafeCell<DmacDescriptor>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl core::ops::DerefMut for DescriptorCell {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    /// Bitfield representing the BTCTRL SRAM DMAC register
+    #[allow(unused_braces)]
+    #[bitfield]
+    #[derive(Clone, Copy)]
+    #[repr(u16)]
+    pub(super) struct BlockTransferControl {
+        pub(super) valid: bool,
+        pub(super) evosel: B2,
+        pub(super) blockact: B2,
+        #[skip]
+        _reserved: B3,
+        #[bits = 2]
+        pub(super) beatsize: BeatSize,
+        pub(super) srcinc: bool,
+        pub(super) dstinc: bool,
+        pub(super) stepsel: bool,
+        pub(super) stepsize: B3,
+    }
+
+    impl Default for BlockTransferControl {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    /// Descriptor representing a SRAM register. Datasheet section 19.8.2
+    #[derive(Clone, Copy)]
+    #[repr(C, align(16))]
+    pub struct DmacDescriptor {
+        pub(super) btctrl: BlockTransferControl,
+        pub(super) btcnt: u16,
+        pub(super) srcaddr: *const (),
+        pub(super) dstaddr: *const (),
+        pub(super) descaddr: *const DmacDescriptor,
+    }
+
+    impl DmacDescriptor {
+        pub const fn default() -> Self {
+            Self {
+                btctrl: BlockTransferControl::new(),
+                btcnt: 0,
+                srcaddr: 0 as *mut _,
+                dstaddr: 0 as *mut _,
+                descaddr: 0 as *mut _,
+            }
+        }
+
+        pub fn next_descriptor(&self) -> *const DmacDescriptor {
+            self.descaddr
+        }
+
+        pub fn set_next_descriptor(&mut self, next: *mut DmacDescriptor) {
+            self.descaddr = next;
+        }
+
+        pub fn beat_count(&self) -> u16 {
+            self.btcnt
+        }
+    }
+
+    /// Writeback section.
+    ///
+    /// # Safety
+    ///
+    /// This variable should never be accessed. The only thing we need
+    /// to know about it is its starting address, given by
+    /// [`writeback_addr`].
+    static WRITEBACK: [DescriptorCell; NUM_CHANNELS] =
+        [const { DescriptorCell::default() }; NUM_CHANNELS];
+
+    // We only ever need to know its starting address.
+    pub(super) fn writeback_addr() -> *mut DmacDescriptor {
+        WRITEBACK[0].get()
+    }
+
+    /// Descriptor section.
+    ///
+    /// # Safety
+    ///
+    /// All accesses to this variable should be synchronized. Elements of the
+    /// array should only ever be accessed using [`UnsafeCell::get`]. Any other
+    /// access method, such as taking a reference to the [`UnsafeCell`] itself,
+    /// is UB and *will* break DMA transfers - speaking from personal
+    /// experience.
+    static DESCRIPTOR_SECTION: [DescriptorCell; NUM_CHANNELS] =
+        [const { DescriptorCell::default() }; NUM_CHANNELS];
+
+    #[inline]
+    pub(super) fn descriptor_section_addr() -> *mut DmacDescriptor {
+        DESCRIPTOR_SECTION[0].get()
+    }
+
+    /// Get a mutable pointer to the specified channel's DMAC descriptor
+    ///
+    /// # Safety
+    ///
+    /// The caller must manually synchronize any access to the pointee
+    /// [`DmacDescriptor`].
+    ///
+    /// Additionnally, if the pointer is used to create references to
+    /// [`DmacDescriptor`], the caller must guarantee that there will **never**
+    /// be overlapping `&mut` references (or overlapping `&mut` and `&`
+    /// references) to the pointee *at any given time*, as it would be
+    /// instantaneous undefined behaviour.
+    #[inline]
+    pub(super) unsafe fn get_descriptor(channel_id: usize) -> *mut DmacDescriptor {
+        DESCRIPTOR_SECTION[channel_id].get()
     }
 }
-
-/// Bitfield representing the BTCTRL SRAM DMAC register
-#[bitfield]
-#[derive(Clone, Copy)]
-#[repr(u16)]
-#[doc(hidden)]
-pub struct BlockTransferControl {
-    #[allow(dead_code)]
-    valid: bool,
-    #[allow(dead_code)]
-    evosel: B2,
-    #[allow(dead_code)]
-    blockact: B2,
-    #[skip]
-    _reserved: B3,
-    #[bits = 2]
-    #[allow(dead_code)]
-    beatsize: BeatSize,
-    #[allow(dead_code)]
-    srcinc: bool,
-    #[allow(dead_code)]
-    dstinc: bool,
-    #[allow(dead_code)]
-    stepsel: bool,
-    #[allow(dead_code)]
-    stepsize: B3,
-}
-
-/// Descriptor representing a SRAM register. Datasheet section 19.8.2
-#[derive(Clone, Copy)]
-#[repr(C, align(16))]
-#[doc(hidden)]
-pub struct DmacDescriptor {
-    btctrl: BlockTransferControl,
-    btcnt: u16,
-    srcaddr: *const (),
-    dstaddr: *const (),
-    descaddr: *const DmacDescriptor,
-}
-
-#[doc(hidden)]
-pub const DEFAULT_DESCRIPTOR: DmacDescriptor = DmacDescriptor {
-    btctrl: BlockTransferControl::new(),
-    btcnt: 0,
-    srcaddr: 0 as *mut _,
-    dstaddr: 0 as *mut _,
-    descaddr: 0 as *mut _,
-};
-
-// Writeback section. This static variable should never be written to in an
-// interrupt or thread context.
-#[doc(hidden)]
-static mut WRITEBACK: [DmacDescriptor; NUM_CHANNELS] = [DEFAULT_DESCRIPTOR; NUM_CHANNELS];
-// Descriptor section. This static variable should never be written to in an
-// interrupt or thread context.
-#[doc(hidden)]
-static mut DESCRIPTOR_SECTION: [DmacDescriptor; NUM_CHANNELS] = [DEFAULT_DESCRIPTOR; NUM_CHANNELS];
 
 pub mod channel;
 pub mod dma_controller;
 pub mod transfer;
+
+#[cfg(feature = "async")]
+pub mod async_api;
+#[cfg(feature = "async")]
+pub use async_api::*;
+
+#[cfg(feature = "async")]
+mod waker {
+    use embassy_sync::waitqueue::AtomicWaker;
+
+    #[allow(clippy::declare_interior_mutable_const)]
+    const NEW_WAKER: AtomicWaker = AtomicWaker::new();
+    pub(super) static WAKERS: [AtomicWaker; with_num_channels!(get)] =
+        [NEW_WAKER; with_num_channels!(get)];
+}

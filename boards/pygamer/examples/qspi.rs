@@ -38,17 +38,17 @@ fn main() -> ! {
     let mut peripherals = Peripherals::take().unwrap();
     let core = CorePeripherals::take().unwrap();
     let mut clocks = GenericClockController::with_internal_32kosc(
-        peripherals.GCLK,
-        &mut peripherals.MCLK,
-        &mut peripherals.OSC32KCTRL,
-        &mut peripherals.OSCCTRL,
-        &mut peripherals.NVMCTRL,
+        peripherals.gclk,
+        &mut peripherals.mclk,
+        &mut peripherals.osc32kctrl,
+        &mut peripherals.oscctrl,
+        &mut peripherals.nvmctrl,
     );
     let mut delay = Delay::new(core.SYST, &mut clocks);
 
-    let sets = Pins::new(peripherals.PORT).split();
+    let sets = Pins::new(peripherals.port).split();
 
-    let mut flash = sets.flash.init(&mut peripherals.MCLK, peripherals.QSPI);
+    let mut flash = sets.flash.init(&mut peripherals.mclk, peripherals.qspi);
 
     // Startup delay. Can't find documented but Adafruit use 5ms
     delay.delay_ms(5u8);
@@ -99,7 +99,9 @@ fn main() -> ! {
     flash.read_memory(0, &mut read_buf);
     assert_eq!(read_buf, write_buf);
 
-    loop {}
+    loop {
+        cortex_m::asm::wfi();
+    }
 }
 
 /// Wait for the write-in-progress and suspended write/erase.

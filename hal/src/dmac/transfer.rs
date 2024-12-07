@@ -83,12 +83,11 @@
 //!   stopped.
 
 use super::{
-    channel::{AnyChannel, Busy, CallbackStatus, Channel, ChannelId, InterruptFlags, Ready},
-    dma_controller::{ChId, TriggerAction, TriggerSource},
-    BlockTransferControl, DmacDescriptor, Error, Result, DESCRIPTOR_SECTION,
+    channel::{AnyChannel, Busy, Channel, ChannelId, InterruptFlags, Ready},
+    dma_controller::{TriggerAction, TriggerSource},
+    Error, ReadyChannel, Result,
 };
 use crate::typelevel::{Is, Sealed};
-use core::{ptr::null_mut, sync::atomic};
 use modular_bitfield::prelude::*;
 
 //==============================================================================
@@ -108,7 +107,7 @@ pub enum BeatSize {
 }
 
 /// Convert 8, 16 and 32 bit types
-/// into [`BeatSize`](BeatSize)
+/// into [`BeatSize`]
 ///
 /// # Safety
 ///
@@ -302,22 +301,22 @@ where
 // TODO change source and dest types to Pin? (see https://docs.rust-embedded.org/embedonomicon/dma.html#immovable-buffers)
 /// DMA transfer, owning the resources until the transfer is done and
 /// [`Transfer::wait`] is called.
-pub struct Transfer<Chan, Buf, W = ()>
+pub struct Transfer<Chan, Buf>
 where
     Buf: AnyBufferPair,
     Chan: AnyChannel,
 {
     chan: Chan,
     buffers: Buf,
-    waker: Option<W>,
     complete: bool,
 }
 
-impl<C, S, D> Transfer<C, BufferPair<S, D>>
+impl<C, S, D, R> Transfer<C, BufferPair<S, D>>
 where
     S: Buffer + 'static,
     D: Buffer<Beat = S::Beat> + 'static,
-    C: AnyChannel<Status = Ready>,
+    C: AnyChannel<Status = R>,
+    R: ReadyChannel,
 {
     /// Safely construct a new `Transfer`. To guarantee memory safety, both
     /// buffers are required to be `'static`.
@@ -328,9 +327,10 @@ where
     /// (as opposed to slices), then it is recommended to use the
     /// [`Transfer::new_from_arrays`] method instead.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if both buffers have a length > 1 and are not of equal length.
+    /// Returns [`Error::LengthMismatch`] if both
+    /// buffers have a length > 1 and are not of equal length.
     #[allow(clippy::new_ret_no_self)]
     #[inline]
     pub fn new(
@@ -347,14 +347,14 @@ where
     }
 }
 
-impl<S, D, C, W> Transfer<C, BufferPair<S, D>, W>
+impl<S, D, C> Transfer<C, BufferPair<S, D>>
 where
     S: Buffer,
     D: Buffer<Beat = S::Beat>,
     C: AnyChannel,
 {
     #[inline]
-    fn check_buffer_pair(source: &S, destination: &D) -> Result<()> {
+    pub(super) fn check_buffer_pair(source: &S, destination: &D) -> Result<()> {
         let src_len = source.buffer_len();
         let dst_len = destination.buffer_len();
 
@@ -364,72 +364,14 @@ where
             Ok(())
         }
     }
-
-    #[inline]
-    unsafe fn fill_descriptor(source: &mut S, destination: &mut D, circular: bool) {
-        let id = <C as AnyChannel>::Id::USIZE;
-
-        // Enable support for circular transfers. If circular_xfer is true,
-        // we set the address of the "next" block descriptor to actually
-        // be the same address as the current block descriptor.
-        // Otherwise we set it to NULL, which terminates the transaction.
-        // TODO: Enable support for linked lists (?)
-        let descaddr = if circular {
-            // SAFETY This is safe as we are only reading the descriptor's address,
-            // and not actually writing any data to it. We also assume the descriptor
-            // will never be moved.
-            &mut DESCRIPTOR_SECTION[id] as *mut _
-        } else {
-            null_mut()
-        };
-
-        let src_ptr = source.dma_ptr();
-        let src_inc = source.incrementing();
-        let src_len = source.buffer_len();
-
-        let dst_ptr = destination.dma_ptr();
-        let dst_inc = destination.incrementing();
-        let dst_len = destination.buffer_len();
-
-        let length = core::cmp::max(src_len, dst_len);
-
-        // Channel::xfer_complete() tests the channel enable bit, which indicates
-        // that a transfer has completed iff the blockact field in btctrl is not
-        // set to SUSPEND.  We implicitly leave blockact set to NOACT here; if
-        // that changes Channel::xfer_complete() may need to be modified.
-        let btctrl = BlockTransferControl::new()
-            .with_srcinc(src_inc)
-            .with_dstinc(dst_inc)
-            .with_beatsize(S::Beat::BEATSIZE)
-            .with_valid(true);
-
-        let xfer_descriptor = DmacDescriptor {
-            // Next descriptor address:  0x0 terminates the transaction (no linked list),
-            // any other address points to the next block descriptor
-            descaddr,
-            // Source address: address of the last beat transfer source in block
-            srcaddr: src_ptr as *mut _,
-            // Destination address: address of the last beat transfer destination in block
-            dstaddr: dst_ptr as *mut _,
-            // Block transfer count: number of beats in block transfer
-            btcnt: length as u16,
-            // Block transfer control: Datasheet  section 19.8.2.1 p.329
-            btctrl,
-        };
-
-        // SAFETY this is safe as long as we ONLY write to the descriptor
-        // belonging to OUR channel. We assume this is the only place
-        // in the entire library that this section or the array
-        // will be written to.
-        DESCRIPTOR_SECTION[id] = xfer_descriptor;
-    }
 }
 
-impl<C, S, D> Transfer<C, BufferPair<S, D>>
+impl<C, S, D, R> Transfer<C, BufferPair<S, D>>
 where
     S: Buffer,
     D: Buffer<Beat = S::Beat>,
-    C: AnyChannel<Status = Ready>,
+    C: AnyChannel<Status = R>,
+    R: ReadyChannel,
 {
     /// Construct a new `Transfer` without checking for memory safety.
     ///
@@ -447,12 +389,13 @@ where
     ///   not of equal size.
     #[inline]
     pub unsafe fn new_unchecked(
-        chan: C,
+        mut chan: C,
         mut source: S,
         mut destination: D,
         circular: bool,
     ) -> Transfer<C, BufferPair<S, D>> {
-        Self::fill_descriptor(&mut source, &mut destination, circular);
+        chan.as_mut()
+            .fill_descriptor(&mut source, &mut destination, circular);
 
         let buffers = BufferPair {
             source,
@@ -462,7 +405,6 @@ where
         Transfer {
             buffers,
             chan,
-            waker: None,
             complete: false,
         }
     }
@@ -474,62 +416,49 @@ where
     D: Buffer<Beat = S::Beat>,
     C: AnyChannel<Status = Ready>,
 {
-    /// Append a waker to the transfer. This will be called when the DMAC
-    /// interrupt is called.
-    #[inline]
-    pub fn with_waker<W: FnOnce(CallbackStatus) + 'static>(
-        self,
-        waker: W,
-    ) -> Transfer<C, BufferPair<S, D>, W> {
-        Transfer {
-            buffers: self.buffers,
-            chan: self.chan,
-            complete: self.complete,
-            waker: Some(waker),
-        }
-    }
-}
-
-impl<C, S, D, W> Transfer<C, BufferPair<S, D>, W>
-where
-    S: Buffer,
-    D: Buffer<Beat = S::Beat>,
-    C: AnyChannel<Status = Ready>,
-{
-    /// Begin DMA transfer. If [TriggerSource::DISABLE](TriggerSource::DISABLE)
-    /// is used, a software trigger will be issued to the DMA channel to
-    /// launch the transfer. Is is therefore not necessary, in most cases,
-    /// to manually issue a software trigger to the channel.
+    /// Begin DMA transfer in blocking mode. If [`TriggerSource::Disable`] is
+    /// used, a software trigger will be issued to the DMA channel to launch
+    /// the transfer. Is is therefore not necessary, in most cases, to manually
+    /// issue a software trigger to the channel.
     #[inline]
     pub fn begin(
         mut self,
         trig_src: TriggerSource,
         trig_act: TriggerAction,
-    ) -> Transfer<Channel<ChannelId<C>, Busy>, BufferPair<S, D>, W> {
+    ) -> Transfer<Channel<ChannelId<C>, Busy>, BufferPair<S, D>> {
         // Reset the complete flag before triggering the transfer.
         // This way an interrupt handler could set complete to true
         // before this function returns.
         self.complete = false;
 
-        // Memory barrier to prevent the compiler/CPU from re-ordering read/write
-        // operations beyond this fence.
-        // (see https://docs.rust-embedded.org/embedonomicon/dma.html#compiler-misoptimizations)
-        atomic::fence(atomic::Ordering::Release); //  ▲
         let chan = self.chan.into().start(trig_src, trig_act);
 
         Transfer {
             buffers: self.buffers,
             chan,
-            waker: self.waker,
             complete: self.complete,
         }
     }
+
+    /// Free the [`Transfer`] and return the resources it holds.
+    ///
+    /// Similar to [`stop`](Transfer::stop), but it acts on a [`Transfer`]
+    /// holding a [`Ready`] channel, so there is no need to explicitly stop the
+    /// transfer.
+    pub fn free(self) -> (Channel<ChannelId<C>, Ready>, S, D) {
+        (
+            self.chan.into(),
+            self.buffers.source,
+            self.buffers.destination,
+        )
+    }
 }
 
-impl<B, C, const N: usize> Transfer<C, BufferPair<&'static mut [B; N]>>
+impl<B, C, R, const N: usize> Transfer<C, BufferPair<&'static mut [B; N]>>
 where
     B: 'static + Beat,
-    C: AnyChannel<Status = Ready>,
+    C: AnyChannel<Status = R>,
+    R: ReadyChannel,
 {
     /// Create a new `Transfer` from static array references of the same type
     /// and length. When two array references are available (instead of slice
@@ -548,7 +477,7 @@ where
     }
 }
 
-impl<S, D, C, W> Transfer<C, BufferPair<S, D>, W>
+impl<S, D, C> Transfer<C, BufferPair<S, D>>
 where
     S: Buffer,
     D: Buffer<Beat = S::Beat>,
@@ -632,7 +561,9 @@ where
 
         // Circular transfers won't ever complete, so never re-fill as one
         unsafe {
-            Self::fill_descriptor(&mut source, &mut destination, false);
+            self.chan
+                .as_mut()
+                .fill_descriptor(&mut source, &mut destination, false);
         }
 
         let new_buffers = BufferPair {
@@ -641,14 +572,12 @@ where
         };
 
         let old_buffers = core::mem::replace(&mut self.buffers, new_buffers);
-
         self.chan.as_mut().restart();
-
         Ok((old_buffers.source, old_buffers.destination))
     }
 
     /// Modify a completed transfer with a new `destination`, then restart.
-
+    ///
     /// Returns a Result containing the destination from the
     /// completed transfer. Returns `Err(_)` if the buffer lengths are
     /// mismatched or if the previous transfer has not yet completed.
@@ -662,18 +591,18 @@ where
 
         // Circular transfers won't ever complete, so never re-fill as one
         unsafe {
-            Self::fill_descriptor(&mut self.buffers.source, &mut destination, false);
+            self.chan
+                .as_mut()
+                .fill_descriptor(&mut self.buffers.source, &mut destination, false);
         }
 
         let old_destination = core::mem::replace(&mut self.buffers.destination, destination);
-
         self.chan.as_mut().restart();
-
         Ok(old_destination)
     }
 
     /// Modify a completed transfer with a new `source`, then restart.
-
+    ///
     /// Returns a Result containing the source from the
     /// completed transfer. Returns `Err(_)` if the buffer lengths are
     /// mismatched or if the previous transfer has not yet completed.
@@ -687,13 +616,13 @@ where
 
         // Circular transfers won't ever complete, so never re-fill as one
         unsafe {
-            Self::fill_descriptor(&mut source, &mut self.buffers.destination, false);
+            self.chan
+                .as_mut()
+                .fill_descriptor(&mut source, &mut self.buffers.destination, false);
         }
 
         let old_source = core::mem::replace(&mut self.buffers.source, source);
-
         self.chan.as_mut().restart();
-
         Ok(old_source)
     }
 
@@ -701,36 +630,9 @@ where
     /// resources
     #[inline]
     pub fn stop(self) -> (Channel<ChannelId<C>, Ready>, S, D) {
+        // `free()` stops the transfer, waits for the burst to finish, and emits a
+        // compiler fence.
         let chan = self.chan.into().free();
-
-        // Memory barrier to prevent the compiler/CPU from re-ordering read/write
-        // operations beyond this fence.
-        // (see https://docs.rust-embedded.org/embedonomicon/dma.html#compiler-misoptimizations)
-        atomic::fence(atomic::Ordering::Acquire); // ▼
-
         (chan, self.buffers.source, self.buffers.destination)
-    }
-}
-
-impl<S, D, C, W> Transfer<C, BufferPair<S, D>, W>
-where
-    S: Buffer,
-    D: Buffer<Beat = S::Beat>,
-    C: AnyChannel<Status = Busy>,
-    W: FnOnce(CallbackStatus) + 'static,
-{
-    /// This function should be put inside the DMAC interrupt handler.
-    /// It will take care of calling the [`Transfer`]'s waker (if it exists).
-    #[inline]
-    pub fn callback(&mut self) {
-        let status = self.chan.as_mut().callback();
-
-        if let CallbackStatus::TransferComplete = status {
-            self.complete = true;
-        }
-
-        if let Some(w) = self.waker.take() {
-            w(status)
-        }
     }
 }

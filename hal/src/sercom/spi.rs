@@ -240,11 +240,12 @@
 //! type Spi = spi::Spi<Config, Rx>;
 //! ```
 //!
-//! Only `Spi` structs can actually perform transactions. To do so, use the
+//! Only [`Spi`] structs can actually perform transactions. To do so, use the
 //! various embedded HAL traits, like
-//! [`spi::FullDuplex`](crate::ehal_02::spi::FullDuplex),
-//! [`serial::Read`](crate::ehal_02::serial::Read) or
-//! [`serial::Write`](crate::ehal_02::serial::Write).
+//! [`spi::SpiBus`](crate::ehal::spi::SpiBus),
+//! [`embedded_io::Read`], [`embedded_io::Write`],
+//! [`embedded_hal_nb::serial::Read`](crate::ehal_nb::serial::Read), or
+//! [`embedded_hal_nb::serial::Write`](crate::ehal_nb::serial::Write).
 //! See the [`impl_ehal`] module documentation for more details about the
 //! specific trait implementations, which vary based on [`Size`] and
 //! [`Capability`].
@@ -257,52 +258,196 @@
 //! let rcvd: u16 = block!(spi.read());
 //! ```
 //!
+//! ## Flushing the bus
+//!
+//! The [`SpiBus`](crate::ehal::spi::SpiBus) methods do not flush the bus when a
+//! transaction is complete. This is in part to increase performance and allow
+//! for pipelining SPI transactions. This is true for both sync and async
+//! operation. As such, you should ensure you manually call
+//! [`flush`](crate::ehal::spi::SpiBus::flush) when:
+//! * You must synchronize SPI activity and GPIO activity, for example before
+//!   deasserting a CS pin.
+//! * Before deinitializing the SPI peripheral.
+//!
+//! Take note that the [`SpiDevice`](crate::ehal::spi::SpiDevice)
+//! implementations automatically take care of flushing, so no further flushing
+//! is needed.
+//!
+//! [See the embedded-hal spec](https://docs.rs/embedded-hal/latest/embedded_hal/spi/index.html#flushing)
+//! for more information.
+//!
+//! # [`PanicOnRead`] and [`PanicOnWrite`]
+//!
+//! Some driver libraries take a type implementing [`embedded_hal::spi::SpiBus`]
+//! or [`embedded_hal::spi::SpiDevice`], even when they only need to receive or
+//! send data, but not both. A good example is WS2812 addressable LEDs
+//! (neopixels), which only take a data input. Therefore, their protocol can be
+//! implemented with a [`Tx`] [`Spi`] that only has a MOSI pin. In another
+//! example, often LCD screens only have a MOSI and SCK pins. In order to
+//! unnecessarily tying up pins in the [`Spi`] struct, and provide an escape
+//! hatch for situations where constructing the [`Spi`] struct would otherwise
+//! be impossible, we provide the [`PanicOnRead`] and [`PanicOnWrite`] wrapper
+//! types, which implement [`embedded_hal::spi::SpiBus`].
+//!
+//! As the names imply, they panic if an incompatible method is called. See
+//! [`Spi::into_panic_on_write`] and [`Spi::into_panic_on_read`].
+//!
+//! [`PanicOnRead`] and [`PanicOnWrite`] are compatible with DMA.
+//!
+//! # Using SPI with DMA <span class="stab portability" title="Available on crate feature `dma` only"><code>dma</code></span>
+//!
+//! This HAL includes support for DMA-enabled SPI transfers. Use
+//! [`Spi::with_dma_channels`] ([`Duplex`] and [`Rx`]), and
+//! [`Spi::with_tx_channel`] ([`Tx`]-only) to attach DMA channels to the [`Spi`]
+//! struct. A DMA-enabled [`Spi`] implements the
+//! blocking [`embedded_hal::spi::SpiBus`], [`embedded_io::Write`] and/or
+//! [`embedded_io::Read`] traits, which can be used to perform SPI transactions
+//! which are fast, continuous and low jitter, even if they are preemped by a
+//! higher priority interrupt.
+//!
+//! ```
+//! // Assume channel0 and channel1 are configured `dmac::Channel`, and spi a
+//! // fully-configured `Spi`
+//!
+//! // Create data to send
+//! let buffer: [u8; 50] = [0xff; 50];
+//!
+//! // Attach DMA channels
+//! let spi = spi.with_dma_channels(channel0, channel1);
+//!
+//! // Perform the transfer
+//! spi.write(&mut buffer)?;
+//! ```
+//!
+//! # `async` operation <span class="stab portability" title="Available on crate feature `async` only"><code>async</code></span>
+//!
+//! An [`Spi`] can be used for
+//! `async` operations. Configuring a [`Spi`] in async mode is relatively
+//! simple:
+//!
+//! * Bind the corresponding `SERCOM` interrupt source to the SPI
+//!   [`InterruptHandler`] (refer to the module-level [`async_hal`]
+//!   documentation for more information).
+//! * Turn a previously configured [`Spi`] into a [`SpiFuture`] by calling
+//!   [`Spi::into_future`]
+//! * Optionally, add DMA channels to RX, TX or both using
+//!   [`SpiFuture::with_rx_dma_channel`] and [`SpiFuture::with_tx_dma_channel`].
+//!   The API is exactly the same whether DMA channels are used or not.
+//! * Use the provided async methods for reading or writing to the SPI
+//!   peripheral. [`SpiFuture`] implements [`embedded_hal_async::spi::SpiBus`].
+//!
+//! `SpiFuture` implements `AsRef<Spi>` and `AsMut<Spi>` so
+//! that it can be reconfigured using the regular [`Spi`] methods.
+//!
+//! ## Considerations when using `async` [`Spi`] with DMA <span class="stab portability" title="Available on crate feature `async` only"><code>async</code></span> <span class="stab portability" title="Available on crate feature `dma` only"><code>dma</code></span>
+//!
+//! * An [`Spi`] struct must be turned into an [`SpiFuture`] by calling
+//!   [`Spi::into_future`] before calling `with_dma_channel`. The DMA channel
+//!   itself must also be configured in async mode by using
+//!   [`DmaController::into_future`](crate::dmac::DmaController::into_future).
+//!   If a DMA channel is added to the [`Spi`] struct before it is turned into
+//!   an [`SpiFuture`], it will not be able to use DMA in async mode.
+//!
+//! ```
+//! // This will work
+//! let spi = spi.into_future().with_dma_channels(rx_channel, tx_channel);
+//!
+//! // This won't
+//! let spi = spi.with_dma_channels(rx_channel, tx_channel).into_future();
+//! ```
+//!
+//! ### Safety considerations
+//!
+//! In `async` mode, an SPI+DMA transfer does not require `'static` source and
+//! destination buffers. This, in theory, makes its use `unsafe`. However it is
+//! marked as safe for better ergonomics, and to enable the implementation of
+//! the [`embedded_hal_async::spi::SpiBus`] trait.
+//!
+//! This means that, as an user, you **must** ensure that the [`Future`]s
+//! returned by the [`embedded_hal_async::spi::SpiBus`] methods may never be
+//! forgotten through [`forget`] or by wrapping them with a [`ManuallyDrop`].
+//!
+//! The returned futures implement [`Drop`] and will automatically stop any
+//! ongoing transfers; this guarantees that the memory occupied by the
+//! now-dropped buffers may not be corrupted by running transfers.
+//!
+//! This means that using functions like [`futures::select_biased`] to implement
+//! timeouts is safe; transfers will be safely cancelled if the timeout expires.
+//!
+//! This also means that should you [`forget`] this [`Future`] after its
+//! first [`poll`] call, the transfer will keep running, ruining the
+//! now-reclaimed memory, as well as the rest of your day.
+//!
+//! * `await`ing is fine: the [`Future`] will run to completion.
+//! * Dropping an incomplete transfer is also fine. Dropping can happen, for
+//!   example, if the transfer doesn't complete before a timeout expires.
+//! * Dropping an incomplete transfer *without running its destructor* is
+//!   **unsound** and will trigger undefined behavior.
+//!
+//! ```ignore
+//! async fn always_ready() {}
+//!
+//! let mut buffer = [0x00; 10];
+//!
+//! // This is completely safe
+//! spi.read(&mut buffer).await?;
+//!
+//! // This is also safe: we launch a transfer, which is then immediately cancelled
+//! futures::select_biased! {
+//!     _ = spi.read(&mut buffer)?,
+//!     _ = always_ready(),
+//! }
+//!
+//! // This, while contrived, is also safe.
+//! {
+//!     use core::future::Future;
+//!
+//!     let future = spi.read(&mut buffer);
+//!     futures::pin_mut!(future);
+//!     // Assume ctx is a `core::task::Context` given out by the executor.
+//!     // The future is polled, therefore starting the transfer
+//!     future.as_mut().poll(ctx);
+//!
+//!     // Future is dropped here - transfer is cancelled.
+//! }
+//!
+//! // DANGER: This is an example of undefined behavior
+//! {
+//!     use core::future::Future;
+//!     use core::ops::DerefMut;
+//!
+//!     let future = core::mem::ManuallyDrop::new(spi.read(&mut buffer));
+//!     futures::pin_mut!(future);
+//!     // To actually make this example compile, we would need to wrap the returned
+//!     // future from `i2c.read()` in a newtype that implements Future, because we
+//!     // can't actually call as_mut() without being able to name the type we want
+//!     // to deref to.
+//!     let future_ref: &mut SomeNewTypeFuture = &mut future.as_mut();
+//!     future.as_mut().poll(ctx);
+//!
+//!     // Future is NOT dropped here - transfer is not cancelled, resulting un UB.
+//! }
+//! ```
+//!
+//! As you can see, unsoundness is relatively hard to come by - however, caution
+//! should still be exercised.
+//!
 //! [`enable`]: Config::enable
 //! [`gpio`]: crate::gpio
 //! [`Pin`]: crate::gpio::pin::Pin
 //! [`PinId`]: crate::gpio::pin::PinId
 //! [`PinMode`]: crate::gpio::pin::PinMode
-#![cfg_attr(
-    feature = "dma",
-    doc = "
-# Using SPI with DMA
-
-This HAL includes support for DMA-enabled SPI transfers. An enabled [`Spi`]
-struct implements the DMAC [`Buffer`] trait. The provided [`send_with_dma`]
-and [`receive_with_dma`] methods will build and begin a [`dmac::Transfer`]
-to create a non-blocking SPI transfer.
-
-Optionally, interrupts can be enabled on the provided [`Channel`]. Note that
-the `dma` feature must be enabled. Refer to the [`dmac`] module-level
-documentation for more information.
-
-```
-// Assume channel is a configured `dmac::Channel`, and spi a
-// fully-configured `Spi`
-
-// Create data to send
-let buffer: [u8; 50] = [0xff; 50]
-
-// Launch the transfer
-let dma_transfer = spi.send_with_dma(&mut buffer, channel, ());
-
-// Wait for the transfer to complete and reclaim resources
-let (chan0, _, spi, _) = dma_transfer.wait();
-```
-
-[`Buffer`]: crate::dmac::transfer::Buffer
-[`send_with_dma`]: Spi::send_with_dma
-[`receive_with_dma`]: Spi::receive_with_dma
-[`dmac::Transfer`]: crate::dmac::Transfer
-[`Channel`]: crate::dmac::channel::Channel
-[`dmac`]: crate::dmac
-"
-)]
-
-use atsamd_hal_macros::{hal_cfg, hal_docs, hal_macro_helper, hal_module};
+//! [`embedded_hal::spi::SpiBus`]: crate::ehal::spi::SpiBus
+//! [`embedded_hal::spi::SpiDevice`]: crate::ehal::spi::SpiDevice
+//! [`async_hal`]: crate::async_hal
+//! [`forget`]: core::mem::forget
+//! [`ManuallyDrop`]: core::mem::ManuallyDrop
+//! [`Future`]: core::future::Future
+//! [`poll`]: core::future::Future::poll
 
 use core::marker::PhantomData;
 
+use atsamd_hal_macros::{hal_cfg, hal_docs, hal_macro_helper, hal_module};
 use bitflags::bitflags;
 use num_traits::AsPrimitive;
 
@@ -350,6 +495,11 @@ pub mod lengths {
 
 pub mod impl_ehal;
 
+#[cfg(feature = "async")]
+mod async_api;
+#[cfg(feature = "async")]
+pub use async_api::*;
+
 //=============================================================================
 // BitOrder
 //=============================================================================
@@ -367,6 +517,15 @@ pub enum BitOrder {
 // Flags
 //=============================================================================
 
+const DRE: u8 = 0x01;
+const TXC: u8 = 0x02;
+const RXC: u8 = 0x04;
+const SSL: u8 = 0x08;
+const ERROR: u8 = 0x80;
+
+pub const RX_FLAG_MASK: u8 = RXC | ERROR;
+pub const TX_FLAG_MASK: u8 = DRE | TXC;
+
 bitflags! {
     /// Interrupt bit flags for SPI transactions
     ///
@@ -375,12 +534,18 @@ bitflags! {
     /// `INTFLAG` register.
     #[derive(Clone, Copy)]
     pub struct Flags: u8 {
-        const DRE = 0x01;
-        const TXC = 0x02;
-        const RXC = 0x04;
-        const SSL = 0x08;
-        const ERROR = 0x80;
+        const DRE = DRE;
+        const TXC = TXC;
+        const RXC = RXC;
+        const SSL = SSL;
+        const ERROR = ERROR;
     }
+}
+
+#[allow(dead_code)]
+impl Flags {
+    pub(super) const RX: Self = Self::from_bits_retain(RX_FLAG_MASK);
+    pub(super) const TX: Self = Self::from_bits_retain(TX_FLAG_MASK);
 }
 
 //=============================================================================
@@ -392,6 +557,7 @@ bitflags! {
     ///
     /// The available status flags are `BUFOVF` and `LENERR`. The binary format
     /// of the underlying bits exactly matches the `STATUS` register.
+    #[derive(Clone, Copy)]
     pub struct Status: u16 {
         const BUFOVF = 0x0004;
         const LENERR = 0x0800;
@@ -429,6 +595,8 @@ impl Status {
 pub enum Error {
     Overflow,
     LengthError,
+    #[cfg(feature = "dma")]
+    Dma(crate::dmac::Error),
 }
 
 //=============================================================================
@@ -554,7 +722,9 @@ seq_macro::seq!(N in 1..=4 {
 /// the [type-level enum] documentation for more details.
 ///
 /// [type-level enum]: crate::typelevel#type-level-enums
-pub trait Capability: Sealed + Default {}
+pub trait Capability: Sealed + Default {
+    const RX_ENABLE: bool;
+}
 
 /// Sub-set of [`Capability`] variants that can receive data, i.e. [`Rx`] and
 /// [`Duplex`]
@@ -581,7 +751,9 @@ pub struct Rx {
 }
 
 impl Sealed for Rx {}
-impl Capability for Rx {}
+impl Capability for Rx {
+    const RX_ENABLE: bool = true;
+}
 impl Receive for Rx {}
 
 /// Type-level variant of the [`Capability`] enum for simplex, [`Transmit`]-only
@@ -593,7 +765,9 @@ impl Receive for Rx {}
 pub struct Tx;
 
 impl Sealed for Tx {}
-impl Capability for Tx {}
+impl Capability for Tx {
+    const RX_ENABLE: bool = false;
+}
 impl Transmit for Tx {}
 
 /// Type-level variant of the [`Capability`] enum for duplex transactions
@@ -605,7 +779,9 @@ impl Transmit for Tx {}
 pub struct Duplex;
 
 impl Sealed for Duplex {}
-impl Capability for Duplex {}
+impl Capability for Duplex {
+    const RX_ENABLE: bool = true;
+}
 impl Receive for Duplex {}
 impl Transmit for Duplex {}
 
@@ -985,11 +1161,15 @@ where
     where
         Self: ValidConfig,
     {
-        self.regs.rx_enable();
+        if P::Capability::RX_ENABLE {
+            self.regs.rx_enable();
+        }
         self.regs.enable();
         Spi {
             config: self,
             capability: P::Capability::default(),
+            _rx_channel: NoneT,
+            _tx_channel: NoneT,
         }
     }
 }
@@ -1150,13 +1330,15 @@ where
 ///
 /// See the [`impl_ehal`] documentation for details on the implementations of
 /// the embedded HAL traits, which vary based on [`Size`] and [`Capability`].
-pub struct Spi<C, A>
+pub struct Spi<C, A, RxDma = NoneT, TxDma = NoneT>
 where
     C: ValidConfig,
     A: Capability,
 {
     config: C,
     capability: A,
+    _rx_channel: RxDma,
+    _tx_channel: TxDma,
 }
 
 /// Get a shared reference to the underlying [`Config`] struct
@@ -1173,7 +1355,7 @@ where
     }
 }
 
-impl<C, A> Spi<C, A>
+impl<C, A, RxDma, TxDma> Spi<C, A, RxDma, TxDma>
 where
     C: ValidConfig,
     A: Capability,
@@ -1195,14 +1377,17 @@ where
     /// [`Length`], you **must** wait for a TXC flag before changing to a new
     /// [`Length`].
     #[inline]
+    #[allow(clippy::type_complexity)]
     #[hal_cfg("sercom0-d5x")]
-    pub fn length<L: Length>(self) -> Spi<Config<C::Pads, C::OpMode, L>, A>
+    pub fn length<L: Length>(self) -> Spi<Config<C::Pads, C::OpMode, L>, A, RxDma, TxDma>
     where
         Config<C::Pads, C::OpMode, L>: ValidConfig,
     {
         Spi {
             config: self.config.into().length(),
             capability: self.capability,
+            _rx_channel: self._rx_channel,
+            _tx_channel: self._tx_channel,
         }
     }
 
@@ -1303,14 +1488,267 @@ where
     /// Block until at least one of the flags specified in `flags`, or `ERROR`,
     /// is set.
     ///
-    /// # Returns `Err(Error)` if an error is detected.
+    /// Returns `Err(Error)` if an error is detected; also clears the ERROR
+    /// interrupt flag and the affected STATUS flags.
     fn block_on_flags(&mut self, flags: Flags) -> Result<(), Error> {
         while !self.read_flags().intersects(flags | Flags::ERROR) {
             core::hint::spin_loop();
         }
+        let flags = self.read_flags();
+        self.check_and_clear_error(flags)
+    }
 
-        self.read_flags_errors()?;
+    #[inline]
+    fn check_and_clear_error(&mut self, flags: Flags) -> Result<(), Error> {
+        if flags.contains(Flags::ERROR) {
+            let errors = self.read_status();
+            // Clear all status flags at once; BUFOVF has priority, and will mask LENERR if
+            // both show up at the same time.
+            self.clear_status(errors);
+            self.clear_flags(Flags::ERROR);
+            return errors.check_bus_error();
+        }
+
         Ok(())
+    }
+}
+
+impl<C, D> Spi<C, D>
+where
+    C: ValidConfig,
+    D: Receive,
+    C::OpMode: MasterMode,
+{
+    /// Attach RX and TX DMA channels to this [`Spi`]. Its
+    /// [`SpiBus`](crate::ehal::spi::SpiBus) implementation will use DMA to
+    /// carry out its transactions. In Master mode, since even read SPI
+    /// transaction necessarily involve a write, [`Rx`]-only must take two
+    /// DMA channels, just the same as if it were [`Duplex`].
+    #[cfg(feature = "dma")]
+    pub fn with_dma_channels<R, T>(self, rx: R, tx: T) -> Spi<C, D, R, T>
+    where
+        R: crate::dmac::AnyChannel<Status = crate::dmac::Ready>,
+        T: crate::dmac::AnyChannel<Status = crate::dmac::Ready>,
+    {
+        Spi {
+            capability: self.capability,
+            config: self.config,
+            _rx_channel: rx,
+            _tx_channel: tx,
+        }
+    }
+}
+
+#[cfg(feature = "dma")]
+impl<C, D, RxDma, TxDma, S> Spi<C, D, RxDma, TxDma>
+where
+    C: ValidConfig,
+    D: Capability,
+    RxDma: crate::dmac::AnyChannel<Status = S>,
+    TxDma: crate::dmac::AnyChannel<Status = S>,
+    S: crate::dmac::ReadyChannel,
+{
+    /// Reclaim the DMA channels. Any subsequent SPI transaction will not use
+    /// DMA.
+    pub fn take_dma_channels(self) -> (Spi<C, D, NoneT, NoneT>, RxDma, TxDma) {
+        (
+            Spi {
+                capability: self.capability,
+                config: self.config,
+                _rx_channel: NoneT,
+                _tx_channel: NoneT,
+            },
+            self._rx_channel,
+            self._tx_channel,
+        )
+    }
+}
+
+#[cfg(feature = "dma")]
+impl<C> Spi<C, Duplex>
+where
+    C: ValidConfig<OpMode = Slave>,
+{
+    /// Attach a DMA channel to this [`Spi`]. Its
+    /// [`SpiBus`](crate::ehal::spi::SpiBus) implementation will use DMA to
+    /// carry out its transactions. In Slave mode, a [`Duplex`] [`Spi`] needs
+    /// two DMA channels.
+    #[cfg(feature = "dma")]
+    pub fn with_dma_channels_slave<R, T>(self, rx: R, tx: T) -> Spi<C, Duplex, R, T>
+    where
+        R: crate::dmac::AnyChannel<Status = crate::dmac::Ready>,
+        T: crate::dmac::AnyChannel<Status = crate::dmac::Ready>,
+    {
+        Spi {
+            capability: self.capability,
+            config: self.config,
+            _rx_channel: rx,
+            _tx_channel: tx,
+        }
+    }
+}
+
+#[cfg(feature = "dma")]
+impl<C> Spi<C, Rx>
+where
+    C: ValidConfig<OpMode = Slave>,
+{
+    /// Attach a DMA channel to this [`Spi`]. Its
+    /// [`SpiBus`](crate::ehal::spi::SpiBus) implementation will use DMA to
+    /// carry out its transactions. In Slave mode, a [`Rx`] [`Spi`] only needs a
+    /// single DMA channel.
+    #[cfg(feature = "dma")]
+    pub fn with_rx_channel<R>(self, rx: R) -> Spi<C, Rx, R, NoneT>
+    where
+        R: crate::dmac::AnyChannel<Status = crate::dmac::Ready>,
+    {
+        Spi {
+            capability: self.capability,
+            config: self.config,
+            _rx_channel: rx,
+            _tx_channel: NoneT,
+        }
+    }
+}
+
+#[cfg(feature = "dma")]
+impl<C, D, R, T, S> Spi<C, D, R, T>
+where
+    C: ValidConfig,
+    D: Receive,
+    R: crate::dmac::AnyChannel<Status = S>,
+    S: crate::dmac::ReadyChannel,
+{
+    /// Reclaim the Rx DMA channel. Any subsequent SPI transaction will not use
+    /// DMA.
+    #[cfg(feature = "dma")]
+    pub fn take_rx_channel(self) -> (Spi<C, D, NoneT, T>, R) {
+        (
+            Spi {
+                capability: self.capability,
+                config: self.config,
+                _tx_channel: self._tx_channel,
+                _rx_channel: NoneT,
+            },
+            self._rx_channel,
+        )
+    }
+}
+
+#[cfg(feature = "dma")]
+impl<C> Spi<C, Tx>
+where
+    C: ValidConfig,
+{
+    /// Attach a DMA channel to this [`Spi`]. Its
+    /// [`SpiBus`](crate::ehal::spi::SpiBus) implementation will use DMA to
+    /// carry out its transactions. For [`Tx`] [`Spi`]s, only a single DMA
+    /// channel is necessary.
+    #[cfg(feature = "dma")]
+    pub fn with_tx_channel<T>(self, tx: T) -> Spi<C, Tx, NoneT, T>
+    where
+        T: crate::dmac::AnyChannel<Status = crate::dmac::Ready>,
+    {
+        Spi {
+            capability: self.capability,
+            config: self.config,
+            _rx_channel: NoneT,
+            _tx_channel: tx,
+        }
+    }
+}
+
+#[cfg(feature = "dma")]
+impl<C, D, R, T, S> Spi<C, D, R, T>
+where
+    C: ValidConfig,
+    D: Capability,
+    T: crate::dmac::AnyChannel<Status = S>,
+    S: crate::dmac::ReadyChannel,
+{
+    /// Reclaim the DMA channel. Any subsequent SPI transaction will not use
+    /// DMA.
+    pub fn take_tx_channel(self) -> (Spi<C, D, R, NoneT>, T) {
+        (
+            Spi {
+                capability: self.capability,
+                config: self.config,
+                _rx_channel: self._rx_channel,
+                _tx_channel: NoneT,
+            },
+            self._tx_channel,
+        )
+    }
+}
+
+/// Wrapper type around a [`Spi`] that allows using
+/// [`embedded_hal::spi::SpiBus`] even though it only has RX capability. Will
+/// panic if any write-adjacent method is used (ie, `write`, `transfer`,
+/// `transfer_in_place`, and `flush`).
+///
+/// Also implements `Into<Spi>, `AsRef<Spi>` and `AsMut<Spi>` if you need to use
+/// `Spi` methods.
+///
+/// [`embedded_hal::spi::SpiBus`]: crate::ehal::spi::SpiBus
+pub struct PanicOnWrite<T: crate::ehal::spi::ErrorType>(T);
+
+impl<C: ValidConfig, R, T> From<PanicOnWrite<Spi<C, Rx, R, T>>> for Spi<C, Rx, R, T> {
+    fn from(value: PanicOnWrite<Spi<C, Rx, R, T>>) -> Self {
+        value.0
+    }
+}
+
+impl<C: ValidConfig, R, T> AsRef<Spi<C, Rx, R, T>> for PanicOnWrite<Spi<C, Rx, R, T>> {
+    fn as_ref(&self) -> &Spi<C, Rx, R, T> {
+        &self.0
+    }
+}
+impl<C: ValidConfig, R, T> AsMut<Spi<C, Rx, R, T>> for PanicOnWrite<Spi<C, Rx, R, T>> {
+    fn as_mut(&mut self) -> &mut Spi<C, Rx, R, T> {
+        &mut self.0
+    }
+}
+
+impl<C: ValidConfig, R, T> Spi<C, Tx, R, T> {
+    /// Turn a [`Tx`] [`Spi`] into a [`PanicOnWrite`]
+    pub fn into_panic_on_write(self) -> PanicOnWrite<Self> {
+        PanicOnWrite(self)
+    }
+}
+
+/// Wrapper type around a [`Spi`] that allows using
+/// [`embedded_hal::spi::SpiBus`] even though it only has TX capability. Will
+/// panic if any write-adjacent method is used (ie, `read`, `transfer`, and
+/// `transfer_in_place`).
+///
+/// Also implements `Into<Spi>, `AsRef<Spi>` and `AsMut<Spi>` if you need to use
+/// `Spi` methods.
+///
+/// [`embedded_hal::spi::SpiBus`]: crate::ehal::spi::SpiBus
+pub struct PanicOnRead<T: crate::ehal::spi::ErrorType>(T);
+
+impl<C: ValidConfig, R, T> From<PanicOnRead<Spi<C, Tx, R, T>>> for Spi<C, Tx, R, T> {
+    fn from(value: PanicOnRead<Spi<C, Tx, R, T>>) -> Self {
+        value.0
+    }
+}
+
+impl<C: ValidConfig, R, T> AsRef<Spi<C, Tx, R, T>> for PanicOnRead<Spi<C, Tx, R, T>> {
+    fn as_ref(&self) -> &Spi<C, Tx, R, T> {
+        &self.0
+    }
+}
+
+impl<C: ValidConfig, R, T> AsMut<Spi<C, Tx, R, T>> for PanicOnRead<Spi<C, Tx, R, T>> {
+    fn as_mut(&mut self) -> &mut Spi<C, Tx, R, T> {
+        &mut self.0
+    }
+}
+
+impl<C: ValidConfig, R, T> Spi<C, Tx, R, T> {
+    /// Turn a [`Rx`] [`Spi`] into a [`PanicOnRead`]
+    pub fn into_panic_on_read(self) -> PanicOnRead<Self> {
+        PanicOnRead(self)
     }
 }
 

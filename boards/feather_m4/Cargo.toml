@@ -1,6 +1,6 @@
 [package]
 name = "feather_m4"
-version = "0.12.0"
+version = "0.15.0"
 edition = "2021"
 authors = ["Theodore DeRego <tderego94@gmail.com>"]
 description = "Board Support crate for the Adafruit Feather M4"
@@ -25,7 +25,7 @@ features = ["critical-section-single-core"]
 
 [dependencies.atsamd-hal]
 path = "../../hal"
-version = "0.17.0"
+version = "0.20.0"
 default-features = false
 
 [dependencies.usb-device]
@@ -48,18 +48,9 @@ rt = ["cortex-m-rt", "atsamd-hal/samd51j-rt"]
 usb = ["atsamd-hal/usb", "usb-device"]
 dma = ["atsamd-hal/dma"]
 max-channels = ["dma", "atsamd-hal/dma"]
-
-
-[profile.dev]
-incremental = false
-codegen-units = 1
-debug = true
-lto = true
-
-[profile.release]
-debug = true
-lto = true
-opt-level = "s"
+# Enable async support from atsamd-hal
+async = ["atsamd-hal/async"]
+use_semihosting =  []
 
 [[example]]
 name = "pwm"
@@ -74,6 +65,16 @@ required-features = ["dma"]
 
 [[example]]
 name = "uart"
+
+[[example]]
+name = "uart_poll_echo"
+
+[[example]]
+name = "uart_dma_nonblocking"
+required-features = ["dma"]
+
+[[example]]
+name = "uart_dma_blocking"
 required-features = ["dma"]
 
 [[example]]
@@ -90,4 +91,8 @@ required-features = [ "usb"]
 
 [[example]]
 name = "i2c"
-required-features = ["atsamd-hal/dma"]
+required-features = ["dma"]
+
+[[example]]
+name = "spi"
+required-features = ["dma"]

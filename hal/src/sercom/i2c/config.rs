@@ -5,7 +5,7 @@ use crate::{
     pac::sercom0::i2cm::ctrla::Modeselect,
     sercom::{ApbClkCtrl, Sercom},
     time::Hertz,
-    typelevel::{Is, Sealed},
+    typelevel::{Is, NoneT, Sealed},
 };
 
 //=============================================================================
@@ -30,7 +30,7 @@ pub struct Config<P>
 where
     P: PadSet,
 {
-    pub(super) registers: Registers<P::Sercom>,
+    pub(in super::super) registers: Registers<P::Sercom>,
     pads: P,
     freq: Hertz,
 }
@@ -230,7 +230,10 @@ impl<P: PadSet> Config<P> {
     {
         self.registers.enable();
 
-        I2c { config: self }
+        I2c {
+            config: self,
+            _dma_channel: NoneT,
+        }
     }
 }
 
